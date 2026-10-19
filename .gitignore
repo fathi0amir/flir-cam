@@ -31,6 +31,7 @@ desktop.ini
 # FLIR SDK installers (download separately from the vendor)
 vendor/*.exe
 vendor/*.zip
+vendor/*.whl
 
 # Script logs
 scripts/*.err

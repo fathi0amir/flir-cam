@@ -49,18 +49,22 @@ recorded data never disturbs a running acquisition.
 ## Install (uv)
 
 The environment is **pinned to Python 3.12** (`.python-version`, and the wheel
-below is cp312) and fully locked by `uv.lock`:
+is cp312) and fully locked by `uv.lock`.
+
+Before running any `uv` commands, install the **FLIR Spinnaker SDK 4.4** for
+your system and place its matching PySpin wheel in `vendor/` as
+`spinnaker_python-4.4.0.246-cp312-cp312-win_amd64.whl`. This repository does
+not include the wheel. The filename is configured as the local package source
+in `pyproject.toml`; it must match your Python 3.12 and Windows x64 environment.
 
 ```bash
 uv sync                          # GUI deps (PyQt6, pyqtgraph, numpy, h5py, zarr)
 uv sync --extra spinnaker        # + vendored FLIR PySpin 4.4.0.246 wheel
 ```
 
-PySpin is not on PyPI; it is installed from the vendored wheel
-(`vendor/spinnaker_python-4.4.0.246-cp312-cp312-win_amd64.whl`, resolved via
-`[tool.uv.sources]`). Real camera enumeration additionally requires the
+PySpin is not on PyPI; it is installed from the locally supplied wheel. See the
 [FLIR Spinnaker SDK 4.4](https://www.flir.com/products/spinnaker-sdk/)
-(Windows installer) installed on the system.
+for the Windows installer and SDK distribution.
 
 Verify: `uv run python -c "import PySpin; print('pyspin ok')"`
 
