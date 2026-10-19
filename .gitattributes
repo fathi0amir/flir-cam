@@ -1,0 +1,32 @@
+* text=auto
+
+# Source
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.lock text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+
+# Windows scripts
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary
+*.whl binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.tif binary
+*.tiff binary
+*.raw binary
+*.avi binary
+*.mp4 binary
+
+# Vendored docs are not project source
+vendor/docs/** linguist-vendored
+vendor/Examples/** linguist-vendored
