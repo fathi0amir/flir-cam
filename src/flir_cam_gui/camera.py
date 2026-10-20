@@ -12,6 +12,7 @@ import queue
 import time
 import traceback
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -62,6 +63,81 @@ class _WorkerMixin:
         self._cmd_q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._display_settings: Dict[str, Any] = {}
         self._last_frame: Optional[tuple] = None  # (arr, meta)
+        # Single-slot hand-off to the GUI.  The acquisition loop publishes every
+        # frame; the GUI is woken at most once per unconsumed frame and always
+        # receives the newest one, so a slow repaint can never build a backlog
+        # (and never slows acquisition or recording down).
+        self._frame_lock = threading.Lock()
+        self._latest_frame: Optional[tuple] = None
+        self._frame_notified = False
+        self._acq_times: "deque[float]" = deque(maxlen=32)
+        self._last_fps = 0.0
+        self.published_frames = 0      # frames handed to the display mailbox
+        self.display_wakeups = 0       # frameReady emissions (<= paints)
+        self.dropped_frames = 0        # device frames the host never received
+        self._last_frame_id: Optional[int] = None
+
+    # -- frame hand-off (acquisition thread -> GUI thread) -------------------
+    def _publish_frame(self, arr: np.ndarray, meta: Dict[str, Any]) -> None:
+        """Offer *arr* as the newest frame and wake the GUI at most once.
+
+        Cost is constant per frame: the array is stored by reference in the
+        mailbox and a signal is emitted only when the GUI has not consumed the
+        previous notification.  Frames that arrive while the GUI is painting
+        simply replace the mailbox contents; they are still recorded, they are
+        only skipped for *display*.
+        """
+        now = time.monotonic()
+        times = self._acq_times
+        times.append(now)
+        if len(times) > 1:
+            span = times[-1] - times[0]
+            fps = (len(times) - 1) / span if span > 0 else 0.0
+        else:
+            fps = 0.0
+        self._last_fps = fps
+        meta["acquisition_fps"] = round(fps, 2)
+        fid = meta.get("frame_id")
+        if isinstance(fid, int) and not isinstance(fid, bool):
+            last_id = self._last_frame_id
+            if last_id is not None and fid > last_id + 1:
+                self.dropped_frames += fid - last_id - 1
+            self._last_frame_id = fid
+        with self._frame_lock:
+            self._last_frame = (arr, meta)
+            self._latest_frame = (arr, meta)
+            self.published_frames += 1
+            notify = not self._frame_notified
+            if notify:
+                self._frame_notified = True
+                self.display_wakeups += 1
+        if notify:
+            self.frameReady.emit(arr, meta)
+
+    def take_latest_frame(self) -> Optional[tuple]:
+        """Return the newest unpublished frame and allow the next wake-up.
+
+        Called by the GUI; returns ``None`` when it has already caught up.
+        """
+        with self._frame_lock:
+            frame, self._latest_frame = self._latest_frame, None
+            self._frame_notified = False
+            return frame
+
+    @property
+    def measured_fps(self) -> float:
+        """Frame rate measured on the acquisition thread (display independent)."""
+        return self._last_fps
+
+    def _reset_frame_stats(self) -> None:
+        """Start a fresh measurement window for a new acquisition run."""
+        with self._frame_lock:
+            self._acq_times.clear()
+            self._last_fps = 0.0
+            self._last_frame_id = None
+            self.dropped_frames = 0
+            self.published_frames = 0
+            self.display_wakeups = 0
 
     def submit(self, command: Dict[str, Any]) -> None:
         """Queue a command dict, e.g. {"action": "set_feature", ...}."""
@@ -253,6 +329,28 @@ def _tl_value(cam, name: str, default: str = "") -> str:
 _SPINNAKER_LOCK = threading.RLock()
 
 
+def _release_spinnaker(cam_list, system) -> None:
+    """Release the camera list and system instance without raising.
+
+    PySpin references into a system instance must already be gone when this
+    runs: a camera handle that is still alive makes ``Clear()`` /
+    ``ReleaseInstance()`` fail with ``-1004``, and the half-released system
+    then aborts the process (STATUS_STACK_BUFFER_OVERRUN, no traceback) when
+    it is finalized.  Callers therefore drop their camera/node references
+    first; this helper only performs the release itself.
+    """
+    try:
+        if cam_list is not None:
+            cam_list.Clear()
+    except Exception:
+        pass
+    try:
+        if system is not None:
+            system.ReleaseInstance()
+    except Exception:
+        pass
+
+
 def enumerate_cameras() -> List[Dict[str, str]]:
     """Detect every camera Spinnaker can see, without opening any of them.
 
@@ -263,37 +361,29 @@ def enumerate_cameras() -> List[Dict[str, str]]:
     """
     if not PYSPIN_AVAILABLE:
         return []
-    system = None
-    cam_list = None
-    _SPINNAKER_LOCK.acquire()
-    try:
+    with _SPINNAKER_LOCK:
         system = PySpin.System.GetInstance()
-        cam_list = system.GetCameras()
+        cam_list = None
         out: List[Dict[str, str]] = []
-        for i in range(cam_list.GetSize()):
-            try:
-                cam = cam_list.GetByIndex(i)
-            except Exception:
-                continue
-            out.append({
-                "model": _tl_value(cam, "DeviceModelName", "FLIR camera"),
-                "serial": _tl_value(cam, "DeviceSerialNumber", ""),
-                "transport": _tl_value(cam, "DeviceTransportType", ""),
-            })
-        return out
-    finally:
         try:
-            if cam_list is not None:
-                cam_list.Clear()
-        except Exception:
-            pass
-        try:
-            if system is not None:
-                system.ReleaseInstance()
-        except Exception:
-            pass
+            cam_list = system.GetCameras()
+            for i in range(cam_list.GetSize()):
+                cam = None
+                try:
+                    cam = cam_list.GetByIndex(i)
+                    out.append({
+                        "model": _tl_value(cam, "DeviceModelName", "FLIR camera"),
+                        "serial": _tl_value(cam, "DeviceSerialNumber", ""),
+                        "transport": _tl_value(cam, "DeviceTransportType", ""),
+                    })
+                except Exception:
+                    continue
+                finally:
+                    # must happen before Clear()/ReleaseInstance()
+                    del cam
+            return out
         finally:
-            _SPINNAKER_LOCK.release()
+            _release_spinnaker(cam_list, system)
 
 
 class CameraLister(QThread):
@@ -339,6 +429,10 @@ class CameraWorker(QThread, _WorkerMixin):
         self._recording: Optional[Dict[str, Any]] = None
         self._pending_save: Optional[Dict[str, Any]] = None
         self.frame_timeout_ms = 5000
+        # per-format conversion cache (see _to_ndarray)
+        self._pixel_key = object()
+        self._direct_pixels: Optional[bool] = None
+        self._processor = None
 
     # -- lifecycle ---------------------------------------------------------
     def stop(self) -> None:
@@ -397,9 +491,10 @@ class CameraWorker(QThread, _WorkerMixin):
         for i in range(cam_list.GetSize()):
             cam = cam_list.GetByIndex(i)
             serial = _tl_value(cam, "DeviceSerialNumber")
-            seen.append(serial or "?")
             if serial and serial == self.serial:
                 return cam
+            seen.append(serial or "?")
+            del cam          # drop the unmatched handle before the next one
         raise RuntimeError(
             f"No camera with serial '{self.serial}' (detected: "
             f"{', '.join(seen) or 'none'})")
@@ -428,19 +523,14 @@ class CameraWorker(QThread, _WorkerMixin):
                 self.cam.DeInit()
         except Exception:
             pass
-        self.cam = None
-        try:
-            if cam_list is not None:
-                cam_list.Clear()
-        except Exception:
-            pass
-        try:
-            if system is not None:
-                system.ReleaseInstance()
-        except Exception:
-            pass
+        # Every handle into the camera has to be gone before the list and
+        # system instance are released (see _release_spinnaker).
+        self._processor = None
+        self._direct_pixels = None
         self.cam = None
         self.nodemap = None
+        self.stream_nodemap = None
+        _release_spinnaker(cam_list, system)
         self.stateChanged.emit("disconnected")
 
     # -- commands ------------------------------------------------------------
@@ -452,6 +542,7 @@ class CameraWorker(QThread, _WorkerMixin):
             entry = node.GetEntryByName("Continuous")
             if PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
                 node.SetIntValue(entry.GetValue())
+        self._reset_frame_stats()
         self.cam.BeginAcquisition()
         self.acquiring = True
         self.stateChanged.emit("acquiring")
@@ -608,14 +699,15 @@ class CameraWorker(QThread, _WorkerMixin):
             arr = self._to_ndarray(image)
             meta = self._collect_meta(image, arr)
             raw = None
-            if self._raw_needed > 0 or self._recording is not None:
+            # Only a raw-sequence recording consumes the untouched buffer;
+            # copying it for HDF5/Zarr/NumPy/TIFF would just slow the loop.
+            if self._raw_needed > 0:
                 try:
                     count = image.GetBufferSize()
                     raw = bytes(bytearray(image.GetData()[:count]))
                 except Exception:
                     raw = None
-            self._last_frame = (arr, meta)
-            self.frameReady.emit(arr, meta)
+            self._publish_frame(arr, meta)
             self._record_frame(arr, meta, raw)
         finally:
             try:
@@ -624,16 +716,40 @@ class CameraWorker(QThread, _WorkerMixin):
                 pass
 
     def _to_ndarray(self, image) -> np.ndarray:
+        """Convert an acquired image to NumPy, cached per pixel format.
+
+        ``ImagePtr.GetNDArray`` only handles some pixel formats (Mono12p, for
+        example, raises), and the fallback needs an ``ImageProcessor``.  Both
+        the format probe and the processor are created once and reused, so the
+        per-frame path carries no exception and no allocation - at 100+ fps
+        the difference is several frames of headroom per second.
+        """
         try:
-            return image.GetNDArray().copy()
+            key = image.GetPixelFormat()
         except Exception:
+            key = None
+        if key != self._pixel_key:
+            self._pixel_key = key
+            self._direct_pixels = None
+            self._processor = None
+        if self._direct_pixels is None:
+            try:
+                image.GetNDArray()          # probe once, never again per frame
+                self._direct_pixels = True
+            except Exception:
+                self._direct_pixels = False
+        if self._direct_pixels:
+            return image.GetNDArray().copy()
+        processor = self._processor
+        if processor is None:
             processor = PySpin.ImageProcessor()
             processor.SetColorProcessing(
                 PySpin.SPINNAKER_COLOR_PROCESSING_ALGORITHM_HQ_LINEAR)
-            fmt = (PySpin.PixelFormat_RGB8 if image.GetNumChannels() == 3
-                   else PySpin.PixelFormat_Mono16)
-            converted = processor.Convert(image, fmt)
-            return converted.GetNDArray().copy()
+            self._processor = processor
+        fmt = (PySpin.PixelFormat_RGB8 if image.GetNumChannels() == 3
+               else PySpin.PixelFormat_Mono16)
+        converted = processor.Convert(image, fmt)
+        return converted.GetNDArray().copy()
 
     def _collect_meta(self, image, arr) -> Dict[str, Any]:
         def safe(fn, default=None):
@@ -1076,13 +1192,17 @@ class DemoWorker(QThread, _WorkerMixin):
         while not self._stop:
             self._run_commands()
             if self._acquiring:
-                arr, meta = self._make_frame()
-                self._last_frame = (arr, meta)
-                self.frameReady.emit(arr, meta)
-                self._counter += 1
-                self._record_frame(arr, meta)
                 rate = float(self.FEATURES["FrameRate"]["value"])
-                time.sleep(max(0.004, 1.0 / rate))
+                deadline = time.perf_counter() + 1.0 / max(1e-3, rate)
+                arr, meta = self._make_frame()
+                self._counter += 1
+                self._publish_frame(arr, meta)
+                self._record_frame(arr, meta)
+                # pace against a deadline: frame generation time no longer
+                # lowers the simulated frame rate
+                remaining = deadline - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
             else:
                 time.sleep(0.02)
         self.stateChanged.emit("disconnected")
@@ -1191,6 +1311,7 @@ class DemoWorker(QThread, _WorkerMixin):
 
     # -- commands ----------------------------------------------------------
     def _do_start_acquisition(self):
+        self._reset_frame_stats()
         self._acquiring = True
         self.stateChanged.emit("acquiring")
 

@@ -33,6 +33,15 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# pyqtgraph 0.14.0 (the current release) still assigns to ``ndarray.shape``
+# inside its ImageItem downsampling helper, which NumPy 2.5 deprecates.  The
+# warning is raised entirely inside the dependency (once per painted frame),
+# so it is silenced here by exact message and module; keep the rest visible so
+# real warnings from this project still fail the run.  Drop this entry once
+# pyqtgraph ships the np.reshape fix.
+filterwarnings = [
+    "ignore:Setting the shape on a NumPy array has been deprecated in NumPy 2\\.5:DeprecationWarning:pyqtgraph",
+]
 
 [dependency-groups]
 dev = ["pytest>=8"]

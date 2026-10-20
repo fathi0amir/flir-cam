@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,11 @@ from . import frame_reader
 
 APP_TITLE = "FLIR Spinnaker Camera GUI"
 
+#: live-view repaint period (ms).  Acquisition and recording run at the
+#: camera's own rate; the GUI only ever paints the newest frame, so a slow
+#: repaint never stalls the UI event loop or backs frames up in a queue.
+DISPLAY_INTERVAL_MS = 33          # ~30 repaints/s
+
 
 class MainWindow(QMainWindow):
     def __init__(self, demo_default: bool = False, model_default: Optional[str] = None,
@@ -33,7 +39,9 @@ class MainWindow(QMainWindow):
 
         self.worker = None
         self._last_tree: dict = {}
-        self._frame_times: list[float] = []
+        self._frame_times: list[float] = []   # display fallback only
+        self._acq_fps: Optional[float] = None  # measured on the acquisition thread
+        self._pending_frame: Optional[tuple] = None
         self._frames_since_meta = 0
         self._recording = False
         self._lister: Optional[CameraLister] = None
@@ -51,6 +59,12 @@ class MainWindow(QMainWindow):
         self._fps_timer = QTimer(self)
         self._fps_timer.setInterval(500)
         self._fps_timer.timeout.connect(self._update_fps)
+
+        # Repaints are decoupled from acquisition: the timer drains the newest
+        # frame at the display rate, so heavy frames cannot starve the UI.
+        self._paint_timer = QTimer(self)
+        self._paint_timer.setInterval(DISPLAY_INTERVAL_MS)
+        self._paint_timer.timeout.connect(self._paint_pending)
 
         # Start completely disconnected - user must manually connect
         if demo_default or not PYSPIN_AVAILABLE:
@@ -382,10 +396,15 @@ class MainWindow(QMainWindow):
         self._sync_camera_picker()   # lock the picker while connected
         self._refresh_timer.start()
         self._fps_timer.start()
+        self._paint_timer.start()
 
     def _disconnect_camera(self):
         self._refresh_timer.stop()
         self._fps_timer.stop()
+        self._paint_timer.stop()
+        self._pending_frame = None
+        self._acq_fps = None
+        self._frame_times.clear()
         if self.worker is not None:
             worker = self.worker
             worker.stop()
@@ -406,11 +425,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------ acq control
     def _start_acq(self):
         if self.worker:
+            self._acq_fps = None
+            self._frame_times.clear()
             self.worker.submit({"action": "start_acquisition"})
 
     def _stop_acq(self):
         if self.worker:
             self.worker.submit({"action": "stop_acquisition"})
+        self._acq_fps = None
+        self._frame_times.clear()
 
     # -------------------------------------------------------------- signals
     @pyqtSlot(dict)
@@ -452,25 +475,56 @@ class MainWindow(QMainWindow):
         sender = self.sender()
         if sender is not None and sender is not self.worker:
             return
-        self.live.show_frame(arr, dict(meta) if meta else {})
+        source = sender if sender is not None else self.worker
+        latest = source.take_latest_frame() if source is not None else None
+        if latest is not None:
+            # several frames can arrive while the GUI is busy: only the newest
+            # one is ever painted, the rest are skipped for display only
+            arr, meta = latest
+        meta = dict(meta) if meta else {}
+        self._pending_frame = (arr, meta)
+        fps = meta.get("acquisition_fps")
+        if fps:
+            self._acq_fps = float(fps)
         self._frame_times.append(time.monotonic())
         if len(self._frame_times) > 240:
             self._frame_times = self._frame_times[-240:]
         self._frames_since_meta += 1
         if self._frames_since_meta % 8 == 0:
             self._update_info(meta)
+        if source is None:
+            self._paint_pending()    # no worker (offline pushes) - paint at once
+
+    def _paint_pending(self):
+        """Paint the newest frame, at most once per display interval."""
+        frame, self._pending_frame = self._pending_frame, None
+        if frame is None:
+            return
+        arr, meta = frame
+        self.live.show_frame(arr, meta)
 
     def _update_fps(self):
-        if not self._frame_times:
-            self.lbl_fps.setText("0.0")
-            self._update_record_duration()
-            return
-        span = max(0.001, self._frame_times[-1] - self._frame_times[0])
-        n = len(self._frame_times) - 1
-        fps = n / span if span > 0 else 0.0
+        fps = self._acq_fps
+        if fps is None:
+            if not self._frame_times:
+                self.lbl_fps.setText("0.0")
+                self._update_record_duration()
+                return
+            span = max(0.001, self._frame_times[-1] - self._frame_times[0])
+            n = len(self._frame_times) - 1
+            fps = n / span if span > 0 else 0.0
+        dropped = int(getattr(self.worker, "dropped_frames", 0) or 0)
         if self.live._arr is not None:
-            self.live.set_hud_text(f"{fps:5.1f} fps")
+            hud = f"{fps:5.1f} fps"
+            if dropped:
+                hud += f"  {dropped} dropped"
+            self.live.set_hud_text(hud)
         self.lbl_fps.setText(f"{fps:.1f}")
+        self.lbl_fps.setToolTip(
+            f"{dropped} frame(s) produced by the camera but never received by "
+            f"the host; cap AcquisitionFrameRate below the host limit to "
+            f"avoid drops." if dropped else "Acquisition frame rate (measured "
+            "on the acquisition thread, independent of the display).")
         self._update_record_duration(fps)
 
     def _update_record_duration(self, fps=None):
@@ -673,6 +727,11 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- teardown
     def closeEvent(self, event):
         self._disconnect_camera()
+        # a scan still in flight would be destroyed with the window, which Qt
+        # turns into an abort; let it finish first
+        lister = self._lister
+        if lister is not None and lister.isRunning():
+            lister.wait(5000)
         super().closeEvent(event)
 
 
@@ -693,6 +752,10 @@ def main():
                         help="open a saved stack (raw/HDF5/Zarr) in the "
                              "Saved images tab at startup")
     args = parser.parse_args()
+    # A fatal error inside PySpin/Qt aborts the interpreter without a Python
+    # traceback; this prints the C-level stack so a crash is diagnosable
+    # instead of silent.
+    faulthandler.enable()
     app = QApplication(sys.argv)
     app.setApplicationName("flir-cam-gui")
     win = MainWindow(demo_default=args.demo, model_default=args.model,

@@ -44,7 +44,17 @@ A comprehensive Python GUI for **FLIR Spinnaker cameras** (PySpin), built with
 - **Menu → File → Save settings snapshot** for the raw node map dump.
 
 The live camera view and the saved-image viewer are separate tabs, so browsing
-recorded data never disturbs a running acquisition.
+recorded data never disturbs a running acquisition. The live view is also
+decoupled from the acquisition loop: frames go through a single-slot mailbox
+and are repainted at ~30 Hz, always showing the newest frame. Acquisition and
+recording keep running at the camera's own rate, so a slow repaint (large
+sensor, heavy GUI load) can neither drop frames nor stall the UI.
+
+If the **FPS** readout grows a `N dropped` suffix, the camera is producing
+frames faster than this host can receive them. Lower `AcquisitionFrameRate`
+(enable `AcquisitionFrameRateEnable` first) to a value at or below the rate
+the host sustains — around 85 fps on the test machine — for a drop-free
+stream; the tooltip on the FPS label spells this out.
 
 ## Install (uv)
 
