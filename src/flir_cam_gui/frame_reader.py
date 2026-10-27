@@ -623,11 +623,30 @@ class FrameReaderTab(QWidget):
             self.view.set_palette(str(s["palette"]))
         if s.get("orientation"):
             self.view.set_orientation(str(s["orientation"]))
+        self._apply_view_contrast()
+
+    def set_contrast_settings(self, settings: Dict[str, Any]) -> None:
+        """Update only the contrast controls (auto/manual, levels, auto max).
+
+        Used while the user drags the contrast sliders: the palette and
+        orientation are left alone, but the settings are remembered so the
+        next opened stack keeps the same contrast.
+        """
+        keys = ("auto_levels", "bit_depth", "levels", "auto_max_pct")
+        self._display_settings.update({k: settings[k] for k in keys if k in settings})
+        self._apply_view_contrast()
+
+    def _apply_view_contrast(self) -> None:
+        s = self._display_settings
+        if not s:
+            return
         bits = s.get("bit_depth")
         auto = bool(s.get("auto_levels", True))
         if auto:
             bits = bits or self._bit_depth_hint()
-        self.view.set_bit_depth(int(bits or 12), auto)
+        self.view.set_bit_depth(int(bits or 12), auto,
+                                levels=s.get("levels"),
+                                auto_max_pct=s.get("auto_max_pct"))
 
     def _bit_depth_hint(self) -> int:
         info = self._info

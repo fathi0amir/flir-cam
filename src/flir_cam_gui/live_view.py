@@ -110,6 +110,12 @@ class LiveViewWidget(pg.GraphicsLayoutWidget):
         self._follow_mouse = True
         self._bit_depth = 16
         self._auto_levels = True
+        #: display-only contrast.  In manual mode the levels are exactly what
+        #: the user set; in auto mode they are computed from each frame using
+        #: the 0.5th percentile as black and _auto_max_pct as white, so the
+        #: user controls how much of the histogram auto contrast clips.
+        self._auto_max_pct = 99.5
+        self._manual_levels: Optional[Tuple[float, float]] = None
         self._orientation = DEFAULT_ORIENTATION
         self._dragging = False
         self._drag_line: Optional[pg.InfiniteLine] = None
@@ -294,16 +300,32 @@ class LiveViewWidget(pg.GraphicsLayoutWidget):
         if self._auto_levels and a.size:
             step = max(1, a.size // 200_000)
             sub = a.ravel()[::step]
+            # White point: the user-selected upper percentile (99.5 % by
+            # default).  Black point stays at the 0.5th percentile.
+            hi_pct = min(100.0, max(50.0, float(self._auto_max_pct)))
             try:
-                lo, hi = (float(v) for v in np.percentile(sub, (0.5, 99.5)))
+                lo, hi = (float(v) for v in np.percentile(sub, (0.5, hi_pct)))
             except Exception:
                 lo, hi = float(sub.min()), float(sub.max())
-            if hi <= lo:
-                hi = lo + 1.0
+            lo, hi = self._clamp_levels(lo, hi)
             self.img.setLevels([lo, hi])
         else:
-            self.img.setLevels([0, float(2 ** self._bit_depth - 1)])
+            lo, hi = self._manual_levels or (0.0, float(2 ** self._bit_depth - 1))
+            lo, hi = self._clamp_levels(lo, hi)
+            self.img.setLevels([lo, hi])
         self._levels_at = time.monotonic()
+
+    def _clamp_levels(self, lo: float, hi: float) -> Tuple[float, float]:
+        """Keep display levels inside the selected bit depth and non-empty."""
+        top = float(2 ** self._bit_depth - 1)
+        lo = min(max(float(lo), 0.0), top)
+        hi = min(max(float(hi), 0.0), top)
+        if hi <= lo:
+            if lo < top:
+                hi = lo + 1.0
+            else:
+                lo, hi = max(0.0, top - 1.0), top
+        return lo, hi
 
     # -- crosshair -----------------------------------------------------------
     def _on_crosshair_moved(self, _line=None) -> None:
@@ -495,9 +517,24 @@ class LiveViewWidget(pg.GraphicsLayoutWidget):
             self.ci.layout.setColumnStretchFactor(3, 0)
         self._hist.setVisible(self._hist_visible)
 
-    def set_bit_depth(self, bits: int, auto_levels: bool) -> None:
+    def set_bit_depth(self, bits: int, auto_levels: bool,
+                      levels: Optional[tuple] = None,
+                      auto_max_pct: Optional[float] = None) -> None:
+        """Set the display contrast.
+
+        *levels* is ``(min, max)`` for manual mode (``None`` keeps the current
+        one, falling back to the full bit-depth range); *auto_max_pct* is the
+        upper intensity percentile used as white by auto contrast.
+        """
         self._bit_depth = int(bits)
         self._auto_levels = bool(auto_levels)
+        if levels is not None:
+            try:
+                self._manual_levels = (float(levels[0]), float(levels[1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        if auto_max_pct is not None:
+            self._auto_max_pct = float(auto_max_pct)
         self._apply_levels()
 
     def set_follow_mouse(self, follow: bool) -> None:

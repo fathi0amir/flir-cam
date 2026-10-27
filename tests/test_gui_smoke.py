@@ -547,7 +547,9 @@ def test_mainwindow_viewers_and_display_fanout(qapp, tmp_path):
     assert win.live.orientation == "rotate 90° CW"
     assert win.reader_tab.view.orientation == "rotate 90° CW"
     win.palette_combo.setCurrentText("viridis")
-    win.bits_combo.setCurrentText("12-bit")
+    win.bits_combo.setCurrentIndex(win.bits_combo.findData(12))
+    assert win.live.auto_levels is True          # auto contrast is the default
+    win.contrast_auto.setChecked(False)          # manual mode
     assert win.live.auto_levels is False
     assert win.reader_tab.view.bit_depth == 12
 

@@ -125,14 +125,36 @@ hardware, and saturation fraction is reported in frame metadata.
    `.json` sidecar) and *Open folder...* for a Zarr store or a folder of raw
    frames. Play/pause, drag the scrubber, or step with `|< < > >|`; the frame
    metadata line shows what the sidecar recorded for that frame. *Orientation*,
-   *Levels* and *Palette* in the Display panel apply to this viewer too.
+   *Contrast* and *Palette* in the Display panel apply to this viewer too.
 6. **Display panel** — *Orientation* renders the frame as acquired, rotated
    (90° CW/CCW, 180°), flipped (horizontal/vertical) or transposed, for a
    camera that is physically mounted at an angle. Whatever the window shape and
    whatever orientation is picked, the image keeps the sensor's own aspect ratio
    (square pixels, never stretched) and is centred with the whole frame visible;
    *Reset View* refits it instantly.
-7. Save / record with the right-hand panels or the File menu. When it saves an
+7. **Contrast** (display only — it never changes exposure or gain):
+   - *Auto contrast* on (default): each frame's black/white points come from
+     its histogram. *Auto max* is the intensity percentile mapped to white
+     (99.5 % by default, so a few hot pixels do not flatten the image; set it
+     to 100 % to use the brightest pixel).
+   - *Pixel depth* (8 / 10 / 12 / 16-bit) is the bitness of the pixel
+     *values*, not the dtype of the container: a Mono10/Mono12 camera is
+     delivered in a `uint16` array whose values only span 0-1023 or 0-4095.
+     Selecting that bitness limits the contrast sliders to 0-255 / 0-1023 /
+     0-4095 / 0-65535 instead of always exposing the full 16-bit range. If the
+     handles covered the old full range they follow the new bitness; a custom
+     window is clamped to it.
+   - *Auto contrast* off: the *Min* and *Max* sliders (with exact spin boxes)
+     are the black and white points, in the selected pixel-depth scale.
+     The pair is kept ordered (min < max) as you drag.
+   - Both modes apply to the live view and the Saved images viewer; the chosen
+     values are recorded in the sidecar's `display_settings`.
+8. **Save / record** with the right-hand panels or the File menu. The *Output
+   location* panel holds the **Folder** (type it, or *Browse...* to use the OS
+   folder picker) and the **File name**; the format's suffix is appended
+   (`.raw`, `.h5`, `.zarr`, `.npy`, `.tiff`, or `_seq` for a raw sequence) and
+   the line below previews both targets. Nothing is overwritten: an existing
+   name gets `_001`, `_002`, ... instead. When it saves an
    image it **always writes a sidecar** (`<name>.json`) with:
    - `camera_settings` — full node maps (camera + stream),
    - `frame_metadata` — frame ID, device/host timestamps, chunk exposure/gain,

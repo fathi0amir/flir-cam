@@ -6,15 +6,16 @@ import argparse
 import faulthandler
 import sys
 import time
+from enum import IntEnum
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSlot
-from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog,
-                             QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-                             QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-                             QSpinBox, QSplitter, QTabWidget, QVBoxLayout,
-                             QWidget)
+from PyQt6.QtCore import Qt, QStandardPaths, QTimer, pyqtSlot
+from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget,
+                             QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+                             QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                             QPlainTextEdit, QPushButton, QScrollArea, QSlider,
+                             QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget)
 
 from .camera import DEMO_MODELS, PYSPIN_AVAILABLE, CameraLister, create_worker
 from .live_view import ORIENTATIONS, PALETTES, LiveViewWidget
@@ -28,6 +29,38 @@ APP_TITLE = "FLIR Spinnaker Camera GUI"
 #: camera's own rate; the GUI only ever paints the newest frame, so a slow
 #: repaint never stalls the UI event loop or backs frames up in a queue.
 DISPLAY_INTERVAL_MS = 33          # ~30 repaints/s
+
+#: suffix appended to the typed file name for each save / sequence format.
+#: (.raw/.h5/... typed by the user is stripped first, so "stack.h5" never
+#: becomes "stack.h5.h5".)
+_SAVE_SUFFIX = {"raw": ".raw", "hdf5": ".h5", "zarr": ".zarr",
+                "npy": ".npy", "tiff": ".tiff"}
+_RECORD_SUFFIX = {"hdf5_sequence": ".h5", "raw_sequence": "_seq",
+                  "zarr_sequence": ".zarr", "npy_sequence": ".npy",
+                  "tiff_sequence": ".tiff"}
+_IMAGE_SUFFIXES = {".raw", ".h5", ".hdf5", ".zarr", ".npy", ".tif", ".tiff"}
+
+
+class PixelBitDepth(IntEnum):
+    """Significant bits of the pixel values, not the container width.
+
+    Spinnaker delivers Mono10/Mono12 frames in a uint16 container: the values
+    themselves only span 0..1023 / 0..4095.  The display contrast must work in
+    that pixel bitness, not in 16-bit, or the manual limits become unusable.
+    """
+
+    EIGHT = 8
+    TEN = 10
+    TWELVE = 12
+    SIXTEEN = 16
+
+    @property
+    def max_level(self) -> int:
+        return (1 << int(self)) - 1
+
+    @property
+    def label(self) -> str:
+        return f"{int(self)}-bit (0-{self.max_level})"
 
 
 class MainWindow(QMainWindow):
@@ -47,6 +80,7 @@ class MainWindow(QMainWindow):
         self._lister: Optional[CameraLister] = None
         self._cameras: list = []          # last enumeration result
         self._wanted_serial = serial_default   # --serial hint, consumed once
+        self._levels_top: Optional[int] = None  # previous contrast range
 
         self._build_ui()
         self._connect_ui()
@@ -161,8 +195,50 @@ class MainWindow(QMainWindow):
         self.palette_combo.setCurrentIndex(0)
         self.palette_combo.currentTextChanged.connect(self._palette_changed)
         self.bits_combo = QComboBox()
-        self.bits_combo.addItems(["Auto levels", "8-bit", "10-bit", "12-bit", "16-bit"])
+        for depth in PixelBitDepth:
+            # Store a plain int: Qt's findData compares QVariants and would not
+            # match an IntEnum against 8/10/12/16.
+            self.bits_combo.addItem(depth.label, int(depth))
+        self.bits_combo.setCurrentIndex(
+            self.bits_combo.findData(int(PixelBitDepth.TWELVE)))  # 12-bit sensors
+        self.bits_combo.setToolTip(
+            "Pixel bitness of the frame values. A camera may deliver 10- or "
+            "12-bit data in a 16-bit container; select that bitness here so "
+            "the contrast limits cover 0-1023 / 0-4095, not 0-65535.")
         self.bits_combo.currentTextChanged.connect(self._bits_changed)
+        # Contrast is display-only: it never touches exposure or gain.  Auto
+        # mode picks the levels per frame; manual mode uses exactly the limits
+        # the user sets here.
+        self.contrast_auto = QCheckBox("Auto contrast")
+        self.contrast_auto.setChecked(True)
+        self.contrast_auto.setToolTip(
+            "Off: the display maps [min, max] to black/white exactly as set "
+            "below. On: the limits are computed from every frame.")
+        self.auto_max = QDoubleSpinBox()
+        self.auto_max.setRange(50.0, 100.0)
+        self.auto_max.setDecimals(1)
+        self.auto_max.setSingleStep(0.5)
+        self.auto_max.setValue(99.5)
+        self.auto_max.setSuffix(" %")
+        self.auto_max.setKeyboardTracking(False)
+        self.auto_max.setToolTip(
+            "Auto contrast white point: the intensity percentile mapped to "
+            "white (black is the 0.5th percentile). 99.5 % ignores a few "
+            "hot pixels; 100 % maps the brightest pixel to white.")
+        self.levels_min = QSlider(Qt.Orientation.Horizontal)
+        self.levels_min_value = QSpinBox()
+        self.levels_max = QSlider(Qt.Orientation.Horizontal)
+        self.levels_max_value = QSpinBox()
+        for slider, spin, top in ((self.levels_min, self.levels_min_value, 0),
+                                  (self.levels_max, self.levels_max_value, 4095)):
+            slider.setRange(0, 4095)
+            slider.setValue(top)
+            spin.setRange(0, 65535)
+            spin.setValue(top)
+            spin.setKeyboardTracking(False)
+            slider.valueChanged.connect(spin.setValue)
+        self.levels_min_value.setToolTip("Manual contrast: intensity mapped to black")
+        self.levels_max_value.setToolTip("Manual contrast: intensity mapped to white")
         self.follow_mouse = QCheckBox("Crosshair follows mouse")
         self.follow_mouse.setChecked(True)
         self.follow_mouse.toggled.connect(self._follow_mouse_changed)
@@ -176,13 +252,59 @@ class MainWindow(QMainWindow):
         self.reset_view_btn.setToolTip(
             "Fit the image to the viewport (does not move the crosshair)")
         self.reset_view_btn.clicked.connect(self._reset_view)
+
+        def _level_row(slider, spin):
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(slider, 1)
+            row.addWidget(spin)
+            box = QWidget()
+            box.setLayout(row)
+            return box
+
         disp_form.addRow("Palette:", self.palette_combo)
-        disp_form.addRow("Levels:", self.bits_combo)
+        disp_form.addRow("Pixel depth:", self.bits_combo)
+        disp_form.addRow("Contrast:", self.contrast_auto)
+        disp_form.addRow("Auto max:", self.auto_max)
+        disp_form.addRow("Min:", _level_row(self.levels_min, self.levels_min_value))
+        disp_form.addRow("Max:", _level_row(self.levels_max, self.levels_max_value))
         disp_form.addRow("Orientation:", self.orientation_combo)
         disp_form.addRow("", self.follow_mouse)
         disp_form.addRow("", self.hist_chk)
         disp_form.addRow("", self.reset_view_btn)
         right_lay.addWidget(disp_grp)
+
+        # output location - shared by Save and Record, so neither needs a
+        # modal file dialog any more
+        out_grp = QGroupBox("Output location")
+        out_form = QFormLayout(out_grp)
+        self.out_dir_edit = QLineEdit(self._default_output_dir())
+        self.out_dir_edit.setToolTip(
+            "Folder that saved frames and recordings are written to")
+        self.browse_dir_btn = QPushButton("Browse...")
+        self.browse_dir_btn.setToolTip("Pick the output folder in the OS dialog")
+        self.browse_dir_btn.clicked.connect(self._browse_output_dir)
+        dir_row = QHBoxLayout()
+        dir_row.setContentsMargins(0, 0, 0, 0)
+        dir_row.addWidget(self.out_dir_edit, 1)
+        dir_row.addWidget(self.browse_dir_btn)
+        dir_widget = QWidget()
+        dir_widget.setLayout(dir_row)
+        self.out_name_edit = QLineEdit("capture")
+        self.out_name_edit.setToolTip(
+            "Base file name, without extension: the selected format's suffix "
+            "is added (.raw / .h5 / .zarr / .npy / .tiff, _seq for raw "
+            "sequences). A typed image extension is replaced.")
+        # Two lines from the start, so the panel's minimum height is known
+        # when the scroll area is built (it is refreshed below).
+        self.out_hint = QLabel("Save:\nRecord:")
+        self.out_hint.setWordWrap(True)
+        self.out_hint.setMaximumWidth(320)   # never widens the panel on long paths
+        self.out_hint.setStyleSheet("color: gray;")
+        out_form.addRow("Folder:", dir_widget)
+        out_form.addRow("File name:", self.out_name_edit)
+        out_form.addRow("", self.out_hint)
+        right_lay.addWidget(out_grp)
 
         # save last frame
         save_grp = QGroupBox("Save last frame")
@@ -195,13 +317,12 @@ class MainWindow(QMainWindow):
         self.blosc_cname_combo.addItems(["lz4", "zstd"])
         self.blosc_clevel_combo = QComboBox()
         self.blosc_clevel_combo.addItems(["1", "2", "3"])
-        self.save_btn = QPushButton("Save last frame...")
+        self.save_btn = QPushButton("Save last frame")
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self._save_last)
         save_form.addRow("Format:", self.save_fmt_combo)
         save_form.addRow("Blosc (Zarr):", self.blosc_cname_combo)
         save_form.addRow("Compression level:", self.blosc_clevel_combo)
-        save_form.addRow("", self.save_btn)
         right_lay.addWidget(save_grp)
 
         # sequence record
@@ -218,7 +339,7 @@ class MainWindow(QMainWindow):
         self.rec_count.setValue(100)
         self.rec_duration = QLabel("00:00")
         self.rec_count.valueChanged.connect(self._update_record_duration)
-        self.rec_btn = QPushButton("Record N frames...")
+        self.rec_btn = QPushButton("Record N frames")
         self.rec_btn.setEnabled(False)
         self.rec_btn.clicked.connect(self._toggle_record)
         self.stream_chk = QCheckBox("Stream to disk while recording")
@@ -238,12 +359,38 @@ class MainWindow(QMainWindow):
         rec_form.addRow("Stack length (min:sec):", self.rec_duration)
         rec_form.addRow("", self.stream_chk)
         rec_form.addRow("Chunk size (frames):", self.stream_chunk)
-        rec_form.addRow("", self.rec_btn)
         right_lay.addWidget(rec_grp)
         right_lay.addStretch(1)
-        split.addWidget(right)
+        # Without an explicit minimum the scroll area sizes the column below
+        # its own layout minimum, clipping the bottom of the last group.
+        right.setMinimumHeight(right.minimumSizeHint().height())
+        # The settings column is taller than a 1080p screen once every group is
+        # open; let it scroll instead of forcing the whole window past the
+        # bottom of the display.
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setWidget(right)
+        # Only vertical scrolling is wanted: keep the column wide enough for
+        # its longest form row so no horizontal bar appears beside the image.
+        right_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setMinimumWidth(right.minimumSizeHint().width() + 18)
 
-        split.setSizes([430, 800, 300])
+        # The two actions are pinned below the scrolling settings, so Save and
+        # Record stay clickable without scrolling whatever is configured above.
+        panel = QWidget()
+        panel_lay = QVBoxLayout(panel)
+        panel_lay.setContentsMargins(4, 4, 4, 4)
+        panel_lay.setSpacing(6)
+        panel_lay.addWidget(right_scroll, 1)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.addWidget(self.save_btn, 1)
+        actions.addWidget(self.rec_btn, 1)
+        panel_lay.addLayout(actions)
+        split.addWidget(panel)
+
+        split.setSizes([430, 800, 722])
         split.setStretchFactor(1, 1)
 
         # log dock
@@ -260,9 +407,9 @@ class MainWindow(QMainWindow):
 
         # menus
         menu_file = self.menuBar().addMenu("&File")
-        act_raw = menu_file.addAction("Save last frame as raw...", self._save_last_raw)
+        act_raw = menu_file.addAction("Save last frame as raw", self._save_last_raw)
         act_raw.setShortcut("Ctrl+R")
-        act_h5 = menu_file.addAction("Save last frame as HDF5...", self._save_last_hdf5)
+        act_h5 = menu_file.addAction("Save last frame as HDF5", self._save_last_hdf5)
         act_h5.setShortcut("Ctrl+H")
         menu_file.addSeparator()
         menu_file.addAction("Save settings snapshot...", self._save_snapshot)
@@ -285,6 +432,21 @@ class MainWindow(QMainWindow):
             self.worker.submit({"action": "refresh_tree"}))
         self.live.crosshairMoved.connect(self._on_crosshair)
         self.reader_tab.status.connect(self.log_line)
+        # contrast controls (display only)
+        self.contrast_auto.toggled.connect(self._contrast_mode_changed)
+        self.auto_max.valueChanged.connect(self._apply_contrast)
+        self.levels_min_value.valueChanged.connect(
+            lambda _v: self._manual_level_edited("min"))
+        self.levels_max_value.valueChanged.connect(
+            lambda _v: self._manual_level_edited("max"))
+        # output location preview
+        self.out_dir_edit.textChanged.connect(self._update_output_hint)
+        self.out_name_edit.textChanged.connect(self._update_output_hint)
+        self.save_fmt_combo.currentIndexChanged.connect(self._update_output_hint)
+        self.rec_fmt_combo.currentIndexChanged.connect(self._update_output_hint)
+        self._update_level_ranges()
+        self._contrast_mode_changed(self.contrast_auto.isChecked())
+        self._update_output_hint()
 
     # ------------------------------------------------------------ logging
     def log_line(self, text: str):
@@ -417,7 +579,7 @@ class MainWindow(QMainWindow):
         self.save_btn.setEnabled(False)
         self.rec_btn.setEnabled(False)
         self._recording = False
-        self.rec_btn.setText("Record N frames...")
+        self.rec_btn.setText("Record N frames")
         self.live.clear_frame()
         self.lbl_state.setText("disconnected")
         self._sync_camera_picker()   # the picker may be used again
@@ -457,11 +619,11 @@ class MainWindow(QMainWindow):
             self.rec_btn.setText("■ Stop recording")
             self._recording = True
         elif acquiring:
-            self.rec_btn.setText("Record N frames..." if not self._recording
+            self.rec_btn.setText("Record N frames" if not self._recording
                                  else "■ Stop recording")
         else:
             self._recording = False
-            self.rec_btn.setText("Record N frames...")
+            self.rec_btn.setText("Record N frames")
 
     @pyqtSlot(str)
     def _on_error(self, text: str):
@@ -583,22 +745,117 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- displays
     def current_display_settings(self):
-        text = self.bits_combo.currentText()
-        mapping = {"8-bit": 8, "10-bit": 10, "12-bit": 12, "16-bit": 16}
-        auto = text == "Auto levels"
-        settings = {
+        auto = self.contrast_auto.isChecked()
+        return {
             "palette": self.palette_combo.currentText(),
             "follow_mouse": self.follow_mouse.isChecked(),
             "auto_levels": auto,
-            "bit_depth": None if auto else mapping[text],
+            "bit_depth": self._bits_value(),
+            "auto_max_pct": float(self.auto_max.value()),
+            "levels": None if auto else [self.levels_min_value.value(),
+                                         self.levels_max_value.value()],
             "orientation": self.orientation_combo.currentText(),
         }
-        return settings
+
+    def _bits_value(self) -> int:
+        depth = self.bits_combo.currentData()
+        try:
+            return int(depth)
+        except (TypeError, ValueError):
+            return int(PixelBitDepth.TWELVE)
+
+    def _level_top(self) -> int:
+        return (1 << self._bits_value()) - 1
+
+    def _level_controls(self):
+        return (self.levels_min, self.levels_min_value,
+                self.levels_max, self.levels_max_value)
+
+    def _update_level_ranges(self):
+        """Clamp the contrast sliders/spins to the selected pixel bitness."""
+        top = self._level_top()
+        old_top = self._levels_top
+        widgets = self._level_controls()
+        lo = self.levels_min_value.value()
+        hi = self.levels_max_value.value()
+        # If the handles covered the old full range, follow the new bitness
+        # (8-bit 0-255 -> 12-bit 0-4095).  A custom window is only clamped.
+        full_range = old_top is not None and lo <= 0 and hi >= old_top
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            for w in widgets:
+                w.setMaximum(top)
+            if full_range:
+                lo, hi = 0, top
+            else:
+                lo = min(lo, top)
+                hi = min(hi, top)
+                if hi <= lo:
+                    lo, hi = 0, top
+            self._set_level_controls(lo, hi)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+        self._levels_top = top
+        self.levels_min_value.setToolTip(
+            f"Manual contrast: intensity mapped to black (0-{top})")
+        self.levels_max_value.setToolTip(
+            f"Manual contrast: intensity mapped to white (0-{top})")
+
+    def _set_level_controls(self, lo: int, hi: int):
+        widgets = self._level_controls()
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self.levels_min.setValue(lo)
+            self.levels_max.setValue(hi)
+            self.levels_min_value.setValue(lo)
+            self.levels_max_value.setValue(hi)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    def _manual_level_edited(self, which: str):
+        """Keep min < max while the user edits either manual limit."""
+        top = self._level_top()
+        lo = self.levels_min_value.value()
+        hi = self.levels_max_value.value()
+        if lo >= hi:
+            if which == "min":
+                if lo < top:
+                    hi = lo + 1
+                else:
+                    lo, hi = max(0, top - 1), top
+            else:
+                if hi > 0:
+                    lo = hi - 1
+                else:
+                    lo, hi = 0, min(1, top)
+        self._set_level_controls(lo, hi)
+        self._apply_contrast()
+
+    def _contrast_mode_changed(self, auto: bool):
+        self.auto_max.setEnabled(bool(auto))
+        for w in self._level_controls():
+            w.setEnabled(not auto)
+        self._apply_contrast()
+
+    def _apply_contrast(self):
+        """Push auto/manual contrast to both viewers (display only)."""
+        settings = self.current_display_settings()
+        self.live.set_bit_depth(settings["bit_depth"], settings["auto_levels"],
+                                levels=settings["levels"],
+                                auto_max_pct=settings["auto_max_pct"])
+        self.reader_tab.set_contrast_settings(settings)
+        if self.worker:
+            self.worker.set_display_settings(settings)
 
     def _palette_changed(self, name):
         self._apply_display_settings()
 
     def _bits_changed(self, text):
+        self._update_level_ranges()
         self._apply_display_settings()
 
     def _orientation_changed(self, name):
@@ -609,8 +866,9 @@ class MainWindow(QMainWindow):
         record."""
         settings = self.current_display_settings()
         self.live.set_palette(settings["palette"])
-        self.live.set_bit_depth(settings["bit_depth"] or self.live.bit_depth,
-                                settings["auto_levels"])
+        self.live.set_bit_depth(settings["bit_depth"], settings["auto_levels"],
+                                levels=settings["levels"],
+                                auto_max_pct=settings["auto_max_pct"])
         self.live.set_orientation(settings["orientation"])
         self.reader_tab.set_display_settings(settings)
         if self.worker:
@@ -620,6 +878,95 @@ class MainWindow(QMainWindow):
     def _default_suggest(self, ext: str) -> str:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         return str(Path.home() / f"frame_{stamp}.{ext}")
+
+    @staticmethod
+    def _default_output_dir() -> str:
+        location = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.PicturesLocation)
+        return location or str(Path.home())
+
+    def _browse_output_dir(self):
+        """Pick the output folder with the native OS folder dialog."""
+        start = self.out_dir_edit.text().strip() or self._default_output_dir()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select output folder", start)
+        if folder:
+            self.out_dir_edit.setText(folder)
+
+    def _clean_output_base(self) -> Optional[Path]:
+        """Folder / file name from the path fields, without a suffix.
+
+        Returns None when either field is unusable, without talking to the
+        user -- the preview label calls this on every keystroke.
+        """
+        folder_text = self.out_dir_edit.text().strip()
+        name_text = self.out_name_edit.text().strip()
+        if not folder_text or not name_text:
+            return None
+        folder = Path(folder_text).expanduser()
+        if not folder.is_absolute():
+            folder = Path.cwd() / folder
+        # Only a file name may be typed here; directory parts are ignored so
+        # "..\x" cannot escape the chosen folder.
+        stem = Path(Path(name_text).name)
+        if stem.suffix.lower() in _IMAGE_SUFFIXES:
+            stem = stem.with_suffix("")
+        if not stem.name or stem.name in (".", ".."):
+            return None
+        return folder / stem.name
+
+    def _output_base(self) -> Optional[Path]:
+        base = self._clean_output_base()
+        if base is not None:
+            return base
+        if not self.out_dir_edit.text().strip():
+            QMessageBox.warning(self, "Output folder missing",
+                                "Set the output folder first (or use Browse...).")
+        else:
+            QMessageBox.warning(self, "File name missing",
+                                "Set a file name for saved frames/recordings.")
+        return None
+
+    def _prepare_output(self, suffix: str) -> Optional[Path]:
+        """Resolve folder/name + suffix, never overwriting existing data."""
+        base = self._output_base()
+        if base is None:
+            return None
+        path = Path(str(base) + suffix)
+        if path.exists():
+            existing = path.name
+            for i in range(1, 10_000):
+                candidate = Path(f"{base}_{i:03d}{suffix}")
+                if not candidate.exists():
+                    path = candidate
+                    break
+            else:
+                QMessageBox.warning(self, "Output name busy",
+                                    f"No free name next to {path}.")
+                return None
+            self.log_line(f"{existing} exists - writing {path.name} instead.")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "Cannot create output folder",
+                                f"{path.parent}\n\n{exc}")
+            return None
+        return path
+
+    def _update_output_hint(self):
+        base = self._clean_output_base()
+        if base is None:
+            self.out_hint.setText("Set a folder and a file name.")
+            return
+        save_fmt = ("raw", "hdf5", "zarr", "npy",
+                    "tiff")[self.save_fmt_combo.currentIndex()]
+        rec_fmt = ("hdf5_sequence", "raw_sequence", "zarr_sequence",
+                   "npy_sequence", "tiff_sequence")[self.rec_fmt_combo.currentIndex()]
+        # File names only: the folder is in the field right above, and a full
+        # path is one unbreakable word that would stretch the whole panel.
+        self.out_hint.setText(
+            f"Save:   {Path(str(base) + _SAVE_SUFFIX[save_fmt]).name}\n"
+            f"Record: {Path(str(base) + _RECORD_SUFFIX[rec_fmt]).name}")
 
     def _blosc_params(self):
         return {
@@ -637,21 +984,19 @@ class MainWindow(QMainWindow):
     def _save_last(self, fmt: Optional[str] = None):
         if self.worker is None:
             return
+        # QPushButton.clicked passes its `checked` flag, which would arrive
+        # here in place of *fmt* when the button is clicked.
+        if not isinstance(fmt, str):
+            fmt = None
         if fmt is None:
             fmt = ("raw", "hdf5", "zarr", "npy", "tiff")[self.save_fmt_combo.currentIndex()]
-        ext = {"raw": "raw", "hdf5": "h5", "zarr": "zarr", "npy": "npy", "tiff": "tiff"}[fmt]
-        filters = {"raw": "Raw image (*.raw)",
-                   "hdf5": "HDF5 (*.h5 *.hdf5)",
-                   "zarr": "Zarr store (*.zarr)",
-                   "npy": "NumPy array (*.npy)",
-                   "tiff": "BigTIFF image (*.tif *.tiff)"}[fmt]
-        path, _ = QFileDialog.getSaveFileName(
-            self, f"Save last frame ({fmt})", self._default_suggest(ext), filters)
-        if not path:
+        path = self._prepare_output(_SAVE_SUFFIX[fmt])
+        if path is None:
             return
-        self.worker.submit({"action": "save_last", "path": path, "fmt": fmt,
+        self.worker.submit({"action": "save_last", "path": str(path), "fmt": fmt,
                             "display_settings": self.current_display_settings(),
                             "blosc": self._blosc_params()})
+        self.log_line(f"Saving frame to {path} \u2026")
 
     def _toggle_record(self):
         if self.worker is None:
@@ -661,22 +1006,12 @@ class MainWindow(QMainWindow):
             return
         fmt = ("hdf5_sequence", "raw_sequence", "zarr_sequence",
                "npy_sequence", "tiff_sequence")[self.rec_fmt_combo.currentIndex()]
-        plain = {"hdf5_sequence": "HDF5", "raw_sequence": "raw",
-                 "zarr_sequence": "Zarr", "npy_sequence": "NumPy",
-                 "tiff_sequence": "BigTIFF"}[fmt]
         n = int(self.rec_count.value())
-        path, _ = QFileDialog.getSaveFileName(
-            self, f"Record {n} frames ({plain})",
-            self._default_suggest({"hdf5_sequence": "hdf5", "raw_sequence": "raw_seq",
-                                   "zarr_sequence": "zarr", "npy_sequence": "npy",
-                                   "tiff_sequence": "tiff"}[fmt]),
-            {"hdf5_sequence": "HDF5 (*.h5 *.hdf5)", "raw_sequence": "Raw sequence files (*)",
-             "zarr_sequence": "Zarr store (*.zarr)", "npy_sequence": "NumPy stack (*.npy)",
-             "tiff_sequence": "BigTIFF stack (*.tif *.tiff)"}[fmt])
-        if not path:
+        path = self._prepare_output(_RECORD_SUFFIX[fmt])
+        if path is None:
             return
         self.worker.submit({
-            "action": "record", "path": path, "n_frames": n, "fmt": fmt,
+            "action": "record", "path": str(path), "n_frames": n, "fmt": fmt,
             "display_settings": self.current_display_settings(),
             "blosc": self._blosc_params(),
             "stream": self.stream_chk.isChecked(),
