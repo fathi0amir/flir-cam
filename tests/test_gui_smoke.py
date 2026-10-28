@@ -74,6 +74,61 @@ def test_create_worker_defaults_to_demo_without_pyspin():
     assert isinstance(w, DemoWorker)
 
 
+def test_demo_records_raw_sequence(qapp, tmp_path):
+    """Regression: demo raw recording used to die on a missing _raw_needed."""
+    worker = DemoWorker()
+    results = []
+    worker.saveDone.connect(results.append)
+
+    worker._do_start_acquisition()
+    worker._do_record(str(tmp_path / "capture"), 4, "raw_sequence", None)
+    assert worker._raw_needed == 1
+    for _ in range(4):
+        arr, meta = worker._make_frame()
+        worker._record_frame(arr, meta)
+
+    assert results and results[0]["ok"], results
+    assert worker._raw_needed == 0          # released when the recording ends
+
+    folder = Path(results[0]["path"])
+    frames = sorted(folder.glob("frame_*.raw"))
+    assert len(frames) == 4
+    sidecar = json.loads((folder / "sequence.json").read_text())
+    assert sidecar["file"]["type"] == "raw_sequence"
+    assert sidecar["file"]["frames"] == 4
+    sample, _ = worker._make_frame()
+    assert frames[0].stat().st_size == sample.size * sample.dtype.itemsize
+
+    # per-frame attributes are in the parquet table, not the sidecar
+    from flir_cam_gui import savers
+    from flir_cam_gui.frame_reader import describe_source
+    assert sidecar["frame_metadata"]["rows"] == 4
+    rows = savers.read_frame_table(folder / "sequence.frames.parquet")
+    assert [r["file"] for r in rows] == [f.name for f in frames]
+    assert len(rows) == 4 and "frame_id" in rows[0]
+    info = describe_source(folder)
+    assert info.n_frames == 4
+
+
+def test_demo_raw_record_releases_counter_when_stopped_early(qapp, tmp_path):
+    worker = DemoWorker()
+    worker._do_start_acquisition()
+    worker._do_record(str(tmp_path / "early"), 50, "raw_sequence", None)
+    arr, meta = worker._make_frame()
+    worker._record_frame(arr, meta)
+    worker._do_stop_acquisition()                  # finish with frames missing
+    assert worker._raw_needed == 0
+
+
+def test_second_record_request_does_not_leak_raw_counter(qapp, tmp_path):
+    worker = DemoWorker()
+    worker._do_start_acquisition()
+    worker._do_record(str(tmp_path / "a"), 5, "raw_sequence", None)
+    worker._do_record(str(tmp_path / "b"), 5, "hdf5_sequence", None)
+    assert worker._raw_needed == 0
+    assert worker._recording["fmt"] == "hdf5_sequence"
+
+
 # ---------------------------------------------------------------------------
 # Live view
 # ---------------------------------------------------------------------------
@@ -587,7 +642,11 @@ def test_sidecar_written_for_demo_save(tmp_path):
     sidecar_path = Path(str(path) + ".json")
     sc = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert sc["camera_settings"]["camera"]["__type__"] == "category"
-    assert sc["frame_metadata"]["frame_id"] == meta["frame_id"]
+    # per-frame attributes live in the parquet table, not in the JSON
+    assert sc["frame_metadata"]["format"] == "parquet"
+    from flir_cam_gui import savers
+    rows = savers.read_frame_table(savers.frame_table_path(sidecar_path))
+    assert rows[0]["frame_id"] == meta["frame_id"]
 
 
 # ---------------------------------------------------------------------------

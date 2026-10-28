@@ -122,6 +122,21 @@ def stage_files():
     assert raw.stat().st_size == 6291456, raw.stat().st_size
     side = json.loads((out / "frame_a.raw.json").read_text())
     assert set(side) >= {"file", "frame_metadata", "camera_settings", "saved_at_utc"}
+    # schema 2: the JSON is global-only, per-frame rows are in the parquet table
+    from flir_cam_gui.savers import frame_table_path, read_frame_table
+    sidecar_path = out / "frame_a.raw.json"
+    assert side["schema"] == 2
+    assert side["frame_metadata"]["format"] == "parquet"
+    assert "host_timestamp_s" not in sidecar_path.read_text()
+    table = frame_table_path(sidecar_path)
+    rows = read_frame_table(table)
+    assert len(rows) == 1 and rows[0]["frame_id"] >= 0
+    # global-for-every-frame columns are not duplicated in the table
+    assert not {"width", "height", "pixel_format", "chunk",
+                "acquired_dtype", "camera_model", "sensor",
+                "bit_depth", "acquired_shape"} & set(rows[0])
+    p("frame table:", table.name, len(rows), "row(s),",
+      table.stat().st_size, "B; sidecar", sidecar_path.stat().st_size, "B")
     # BFS-U3-200S6M is portrait: 1536 wide x 2048 high (not the other way round)
     assert side["file"]["width"] == 1536 and side["file"]["height"] == 2048
     cam_settings = json.dumps(side["camera_settings"])
@@ -131,6 +146,8 @@ def stage_files():
     assert zarr_sc["file"]["compressor"]["clevel"] == 2
     seq_sc = json.loads((out / "seq.zarr.json").read_text())
     assert seq_sc["file"]["frames"] == 6
+    seq_rows = read_frame_table(frame_table_path(out / "seq.zarr.json"))
+    assert len(seq_rows) == 6, len(seq_rows)
 
     # Live view orientation: the displayed frame is 1536 x 2048 (portrait).
     assert state["dims"] == {(1536, 2048)}, state["dims"]

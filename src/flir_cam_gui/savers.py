@@ -15,6 +15,11 @@ import numpy as np
 
 APP_NAME = "flir-cam-gui"
 
+#: Sidecar schema version.  2 moved the per-frame metadata out of the JSON
+#: (where a few thousand frames made it tens of MB) into a sibling Parquet
+#: table; the JSON keeps only global attributes plus a reference to it.
+SIDECAR_SCHEMA = 2
+
 
 # ---------------------------------------------------------------------------
 # Sidecar
@@ -23,24 +28,28 @@ APP_NAME = "flir-cam-gui"
 def build_sidecar(
     *,
     image_info: Dict[str, Any],
-    frame_meta: Optional[Dict[str, Any]],
     camera_settings: Dict[str, Any],
     display_settings: Optional[Dict[str, Any]] = None,
+    frame_table: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the JSON sidecar dictionary saved next to every image file.
+
+    The sidecar holds *global* attributes only; per-frame acquisition metadata
+    lives in the Parquet table described by ``frame_table`` so recording a few
+    thousand frames does not turn the JSON into a multi-megabyte file.
 
     Parameters
     ----------
     image_info : details about the pixel payload (name, width, height, dtype,
         byte count, pixel format string, storage description).
-    frame_meta : per-frame acquisition metadata (frame id, timestamps, chunk
-        data such as exposure/gain when enabled).
     camera_settings : full GenICam node-map snapshot (as produced by the
         camera worker).
     display_settings : optional live-view display settings that were active.
+    frame_table : reference to the per-frame Parquet table, as returned by
+        :func:`frame_table_entry`.
     """
     sidecar: Dict[str, Any] = {
-        "schema": 1,
+        "schema": SIDECAR_SCHEMA,
         "application": APP_NAME,
         "app_version": _app_version(),
         "host": platform.node(),
@@ -48,9 +57,10 @@ def build_sidecar(
         "python": platform.python_version(),
         "saved_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "file": image_info,
-        "frame_metadata": frame_meta or {},
         "camera_settings": camera_settings,
     }
+    if frame_table is not None:
+        sidecar["frame_metadata"] = dict(frame_table)
     if display_settings:
         sidecar["display_settings"] = display_settings
     return sidecar
@@ -58,6 +68,91 @@ def build_sidecar(
 
 def write_sidecar(path: Path, sidecar: Dict[str, Any]) -> None:
     path.write_text(json.dumps(sidecar, indent=2, default=_json_default), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Per-frame metadata table (Parquet)
+# ---------------------------------------------------------------------------
+
+FRAME_TABLE_SUFFIX = ".frames.parquet"
+FRAME_TABLE_FORMAT = "parquet"
+
+#: Per-frame keys that are identical for every frame of a recording (or that
+#: already live in the sidecar's global ``file`` / ``camera_settings``), so they
+#: are not duplicated in the frame table.  ``chunk`` is dropped as a whole: its
+#: exposure/gain are camera settings and its frame id/timestamp are already
+#: covered by the remaining ``frame_id`` and ``device_timestamp_ns`` columns.
+GLOBAL_FRAME_KEYS = frozenset({
+    "camera_model", "sensor", "bit_depth", "width", "height",
+    "pixel_format", "acquired_shape", "acquired_dtype", "chunk",
+})
+
+
+def frame_table_path(sidecar_path: Path) -> Path:
+    """Where the frame table lives for a sidecar: ``x.h5.json`` ->
+    ``x.h5.frames.parquet`` (``sequence.json`` -> ``sequence.frames.parquet``)."""
+    sidecar_path = Path(sidecar_path)
+    name = sidecar_path.name
+    stem = name[:-len(".json")] if name.endswith(".json") else name
+    return sidecar_path.with_name(stem + FRAME_TABLE_SUFFIX)
+
+
+def frame_table_entry(path: Path, rows: int) -> Dict[str, Any]:
+    """Sidecar reference to a written frame table (name only, next to it)."""
+    return {"format": FRAME_TABLE_FORMAT, "file": Path(path).name,
+            "rows": int(rows)}
+
+
+def _normalise_frames(frames: Any) -> List[Dict[str, Any]]:
+    """Accept one frame dict, a list of them, or ``{"frames": [...]}``."""
+    if isinstance(frames, dict):
+        rows = frames.get("frames")
+        frames = rows if isinstance(rows, list) else [frames]
+    return [dict(f or {}) for f in frames or []]
+
+
+def write_frame_table(path: Path, frames: Sequence[Dict[str, Any]]) -> Path:
+    """Write per-frame metadata as a Parquet table, one row per frame.
+
+    Rows are normalised through JSON first so NumPy scalars and other values
+    the acquisition code hands over become plain Python types; that also keeps
+    the inferred Arrow schema stable across frames.  Columns in
+    :data:`GLOBAL_FRAME_KEYS` are dropped: they are the same for every frame
+    (geometry, sensor, ``chunk``) and already live in the sidecar's global
+    ``file`` / ``camera_settings``.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rows: List[Dict[str, Any]] = []
+    for index, frame in enumerate(_normalise_frames(frames)):
+        clean = json.loads(json.dumps(frame, default=_json_default))
+        clean = {k: v for k, v in clean.items() if k not in GLOBAL_FRAME_KEYS}
+        rows.append({"frame_index": index, **clean})
+    if rows:
+        table = pa.Table.from_pylist(rows)
+        order = ["frame_index"] + [c for c in table.column_names if c != "frame_index"]
+        table = table.select(order)
+    else:
+        table = pa.table({"frame_index": pa.array([], type=pa.int64())})
+    path = Path(path)
+    pq.write_table(table, path, compression="snappy")
+    return path
+
+
+def read_frame_table(path: Path) -> List[Dict[str, Any]]:
+    """Read a frame table back into a list of per-frame dicts."""
+    import pyarrow.parquet as pq
+
+    return [dict(row) for row in pq.read_table(Path(path)).to_pylist()]
+
+
+def write_frame_metadata(sidecar_path: Path,
+                         frames: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Write the frame table beside a sidecar and return its reference."""
+    rows = _normalise_frames(frames)
+    table = write_frame_table(frame_table_path(sidecar_path), rows)
+    return frame_table_entry(table, len(rows))
 
 
 def _json_default(obj: Any) -> Any:
@@ -139,13 +234,15 @@ def save_raw_with_sidecar(
     """Save raw pixel binary + a sidecar holding every setting for that image."""
     path = Path(path)
     write_raw(path, arr)
+    sidecar_path = path.with_suffix(path.suffix + ".json")
+    table = write_frame_metadata(sidecar_path, [frame_meta])
     write_sidecar(
-        path.with_suffix(path.suffix + ".json"),
+        sidecar_path,
         build_sidecar(
             image_info=raw_image_info(path, arr, pixel_format),
-            frame_meta=frame_meta,
             camera_settings=camera_settings,
             display_settings=display_settings,
+            frame_table=table,
         ),
     )
     return path
@@ -183,8 +280,10 @@ def save_hdf5(
             for key, value in flatten_settings(camera_settings).items():
                 f.attrs[f"cam/{key}"] = value
     if include_sidecar:
+        sidecar_path = path.with_suffix(path.suffix + ".json")
+        table = write_frame_metadata(sidecar_path, [frame_meta])
         write_sidecar(
-            path.with_suffix(path.suffix + ".json"),
+            sidecar_path,
             build_sidecar(
                 image_info={
                     "name": path.name, "type": "hdf5_single",
@@ -192,8 +291,8 @@ def save_hdf5(
                     "height": frame_geometry(arr)[0],
                     "channels": frame_geometry(arr)[2],
                     "dtype": str(arr.dtype), "pixel_format": pixel_format},
-                frame_meta=frame_meta, camera_settings=camera_settings,
-                display_settings=display_settings),
+                camera_settings=camera_settings,
+                display_settings=display_settings, frame_table=table),
         )
     return path
 
@@ -238,8 +337,10 @@ def save_hdf5_sequence(
         if camera_settings:
             for key, value in flatten_settings(camera_settings).items():
                 f.attrs[f"cam/{key}"] = value
-    # per-frame metadata as sidecar json as well
-    write_sidecar(path.with_suffix(path.suffix + ".json"), build_sidecar(
+    # Per-frame metadata goes to a columnar table beside the JSON sidecar.
+    sidecar_path = path.with_suffix(path.suffix + ".json")
+    table = write_frame_metadata(sidecar_path, frame_meta_list)
+    write_sidecar(sidecar_path, build_sidecar(
         image_info={
             "name": path.name,
             "type": "hdf5_sequence",
@@ -250,9 +351,9 @@ def save_hdf5_sequence(
             "frames": len(frames),
             "pixel_format": pixel_format,
         },
-        frame_meta={"frames": frame_meta_list},
         camera_settings=camera_settings,
         display_settings=display_settings,
+        frame_table=table,
     ))
     return path
 
@@ -269,14 +370,16 @@ def _save_array_with_sidecar(path: Path, arr: np.ndarray, *, kind: str,
     path = Path(path)
     image = arr[0] if frames is not None and arr.ndim >= 3 else arr
     height, width, channels = frame_geometry(image)
-    write_sidecar(path.with_suffix(path.suffix + ".json"), build_sidecar(
+    sidecar_path = path.with_suffix(path.suffix + ".json")
+    table = write_frame_metadata(sidecar_path, _normalise_frames(frame_meta))
+    write_sidecar(sidecar_path, build_sidecar(
         image_info={"name": path.name, "type": kind, "width": width,
                     "height": height, "channels": channels,
                     "shape": list(arr.shape), "dtype": str(arr.dtype),
                     "bytes": int(arr.nbytes), "pixel_format": pixel_format,
                     **({"frames": int(frames)} if frames is not None else {})},
-        frame_meta=frame_meta, camera_settings=camera_settings,
-        display_settings=display_settings))
+        camera_settings=camera_settings,
+        display_settings=display_settings, frame_table=table))
     return path
 
 
@@ -435,8 +538,10 @@ def save_zarr(
     _zarr_attrs(group, pixel_format=pixel_format, camera_settings=camera_settings,
                 display_settings=display_settings, frame_meta=frame_meta, array=z)
     if include_sidecar:
+        sidecar_path = path.with_suffix(path.suffix + ".json")
+        table = write_frame_metadata(sidecar_path, [frame_meta])
         write_sidecar(
-            path.with_suffix(path.suffix + ".json"),
+            sidecar_path,
             build_sidecar(
                 image_info={
                     "name": path.name, "type": "zarr_single", "format": "zarr3",
@@ -448,8 +553,8 @@ def save_zarr(
                                    "clevel": int(blosc_clevel),
                                    "shuffle": blosc_shuffle},
                 },
-                frame_meta=frame_meta, camera_settings=camera_settings,
-                display_settings=display_settings),
+                camera_settings=camera_settings,
+                display_settings=display_settings, frame_table=table),
         )
     return path
 
@@ -487,11 +592,14 @@ def save_zarr_sequence(
         chunks=(1, *shape), compressors=[codec], overwrite=True,
     )
     z[...] = np.stack(arrs)
+    # Per-frame metadata is *not* stored in the store's JSON attributes any
+    # more: a few thousand frames turned zarr.json into megabytes of JSON.
     _zarr_attrs(group, pixel_format=pixel_format, camera_settings=camera_settings,
-                display_settings=display_settings,
-                frame_meta={"frames": [dict(m or {}) for m in metas]}, array=z)
+                display_settings=display_settings, frame_meta=None, array=z)
+    sidecar_path = path.with_suffix(path.suffix + ".json")
+    table = write_frame_metadata(sidecar_path, [dict(m or {}) for m in metas])
     write_sidecar(
-        path.with_suffix(path.suffix + ".json"),
+        sidecar_path,
         build_sidecar(
             image_info={
                 "name": path.name, "type": "zarr_sequence", "format": "zarr3",
@@ -504,8 +612,8 @@ def save_zarr_sequence(
                                "clevel": int(blosc_clevel),
                                "shuffle": blosc_shuffle},
             },
-            frame_meta={"frames": [dict(m or {}) for m in metas]},
-            camera_settings=camera_settings, display_settings=display_settings),
+            camera_settings=camera_settings, display_settings=display_settings,
+            frame_table=table),
     )
     return path
 

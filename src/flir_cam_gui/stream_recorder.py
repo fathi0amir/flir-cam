@@ -32,16 +32,18 @@ def _sidecar(path: Path, kind: str, frame_shape: tuple, dtype, n_frames: int,
              metas: Sequence[Dict[str, Any]]) -> None:
     h, w = int(frame_shape[0]), int(frame_shape[1])
     channels = int(frame_shape[2]) if len(frame_shape) == 3 else 1
+    sidecar_path = path.with_suffix(path.suffix + ".json")
+    table = savers.write_frame_metadata(sidecar_path,
+                                        [dict(m or {}) for m in metas])
     savers.write_sidecar(
-        path.with_suffix(path.suffix + ".json"),
+        sidecar_path,
         savers.build_sidecar(
             image_info={"name": path.name, "type": kind, "width": w,
                         "height": h, "channels": channels,
                         "dtype": str(dtype), "frames": n_frames,
                         "pixel_format": pixel_format},
-            frame_meta={"frames": [dict(m or {}) for m in metas]},
             camera_settings=camera_settings,
-            display_settings=display_settings))
+            display_settings=display_settings, frame_table=table))
 
 
 class _Appender:

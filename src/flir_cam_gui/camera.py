@@ -76,6 +76,10 @@ class _WorkerMixin:
         self.display_wakeups = 0       # frameReady emissions (<= paints)
         self.dropped_frames = 0        # device frames the host never received
         self._last_frame_id: Optional[int] = None
+        # Number of running recordings that need the untouched camera buffer.
+        # Lives here (not in one backend) because _make_recording() and
+        # _record_frame() in this mixin are shared by both workers.
+        self._raw_needed = 0
 
     # -- frame hand-off (acquisition thread -> GUI thread) -------------------
     def _publish_frame(self, arr: np.ndarray, meta: Dict[str, Any]) -> None:
@@ -165,6 +169,10 @@ class _WorkerMixin:
         accumulating in ``frames``.  ``path`` becomes the format-suffixed
         file this recording will produce.
         """
+        # Recording over an active one abandons it; release its raw-buffer
+        # request first, otherwise the counter would leak and the acquisition
+        # loop would keep copying raw buffers forever.
+        self._release_recording()
         rec: Dict[str, Any] = {"path": Path(path), "fmt": fmt, "frames": [],
                                "raws": [], "metas": [],
                                "remaining": int(n_frames),
@@ -179,6 +187,17 @@ class _WorkerMixin:
             self._raw_needed += 1
         return rec
 
+    def _release_recording(self) -> Optional[Dict[str, Any]]:
+        """Detach the active recording and release its raw-buffer request.
+
+        Both backends finish through here so the ``_raw_needed`` counter can
+        never drift out of sync with ``_recording``.
+        """
+        rec, self._recording = self._recording, None
+        if rec is not None and rec["fmt"] == "raw_sequence":
+            self._raw_needed = max(0, self._raw_needed - 1)
+        return rec
+
     def _record_frame(self, arr: np.ndarray, meta: Dict[str, Any],
                       raw: Optional[bytes] = None) -> None:
         """Append one frame to the active recording (buffered or streaming)."""
@@ -187,8 +206,11 @@ class _WorkerMixin:
             return
         rec["metas"].append(meta)
         if rec["fmt"] == "raw_sequence":
-            if raw is not None:
-                rec["raws"].append(raw)
+            if raw is None:
+                # A backend without a device buffer (the demo worker) hands
+                # over a synthetic array; its exact bytes are the raw frame.
+                raw = np.ascontiguousarray(arr).tobytes(order="C")
+            rec["raws"].append(raw)
         elif rec.get("stream") is not None:
             rec["pending"].append(arr.copy())
             if len(rec["pending"]) >= rec["chunk"]:
@@ -199,6 +221,45 @@ class _WorkerMixin:
         rec["remaining"] -= 1
         if rec["remaining"] <= 0:
             self._finish_recording(early=False)
+
+    def _write_raw_sequence(self, rec: Dict[str, Any],
+                            settings: Dict[str, Any]) -> Path:
+        """Write a raw_sequence recording: one .raw per frame plus a sidecar.
+
+        Shared by both backends so the on-disk layout cannot drift between the
+        device buffer written by the camera worker and the synthetic frames
+        written by the demo worker.
+        """
+        from . import savers
+
+        d = rec["path"]
+        d = d if d.suffix == "" else d.with_suffix("")
+        if not str(d).endswith("_seq"):
+            d = Path(str(d) + "_seq")
+        d.mkdir(parents=True, exist_ok=True)
+        first = rec["metas"][0] if rec["metas"] else {}
+        width, height = int(first.get("width", 0)), int(first.get("height", 0))
+        nchannels = 3 if (rec["raws"] and len(rec["raws"][0]) ==
+                          width * height * 3) else 1
+        index = []
+        for i, raw in enumerate(rec["raws"]):
+            fname = f"frame_{i:06d}.raw"
+            (d / fname).write_bytes(raw)
+            index.append({"file": fname, **rec["metas"][i]})
+        sidecar_path = d / "sequence.json"
+        table = savers.write_frame_metadata(sidecar_path, index)
+        savers.write_sidecar(
+            sidecar_path,
+            savers.build_sidecar(
+                image_info={"type": "raw_sequence", "frames": len(rec["raws"]),
+                            "width": width, "height": height,
+                            "channels": nchannels,
+                            "dtype": _raw_sequence_dtype(first, nchannels),
+                            "byte_order": "little"},
+                camera_settings=settings,
+                display_settings=self._display_settings,
+                frame_table=table))
+        return d
 
     def _finish_streamed(self, rec: Dict[str, Any]) -> None:
         """Flush the tail chunk and collect the streaming writer's result."""
@@ -425,7 +486,6 @@ class CameraWorker(QThread, _WorkerMixin):
         self.stream_nodemap = None
         self.acquiring = False
         self._stop = False
-        self._raw_needed = 0
         self._recording: Optional[Dict[str, Any]] = None
         self._pending_save: Optional[Dict[str, Any]] = None
         self.frame_timeout_ms = 5000
@@ -790,9 +850,9 @@ class CameraWorker(QThread, _WorkerMixin):
         return self.acquiring
 
     def _finish_recording(self, early: bool):
-        rec, self._recording = self._recording, None
-        if rec["fmt"] == "raw_sequence":
-            self._raw_needed = max(0, self._raw_needed - 1)
+        rec = self._release_recording()
+        if rec is None:
+            return
         if rec.get("stream") is not None:
             self._finish_streamed(rec)
             return
@@ -833,32 +893,7 @@ class CameraWorker(QThread, _WorkerMixin):
                     camera_settings=settings,
                     display_settings=self._display_settings)
             else:  # raw_sequence -> folder of .raw files + sidecar
-                d = rec["path"]
-                d = d if d.suffix == "" else d.with_suffix("")
-                if not str(d).endswith("_seq"):
-                    d = Path(str(d) + "_seq")
-                d.mkdir(parents=True, exist_ok=True)
-                first_meta = rec["metas"][0] if rec["metas"] else {}
-                width, height = int(first_meta.get("width", 0)), int(first_meta.get("height", 0))
-                nchannels = 3 if (rec["raws"] and len(rec["raws"][0]) ==
-                                  width * height * 3) else 1
-                index = []
-                for i, raw in enumerate(rec["raws"]):
-                    fname = f"frame_{i:06d}.raw"
-                    (d / fname).write_bytes(raw)
-                    index.append({"file": fname, **rec["metas"][i]})
-                savers.write_sidecar(
-                    d / "sequence.json",
-                    savers.build_sidecar(
-                        image_info={"type": "raw_sequence", "frames": len(rec["raws"]),
-                                    "width": width, "height": height,
-                                    "channels": nchannels,
-                                    "dtype": _raw_sequence_dtype(first_meta, nchannels),
-                                    "byte_order": "little"},
-                        frame_meta={"frames": index},
-                        camera_settings=settings,
-                        display_settings=self._display_settings))
-                out = d
+                out = self._write_raw_sequence(rec, settings)
             msg = f"Recorded: {out}"
             self.saveDone.emit({"ok": True, "path": str(out), "message": msg})
         except Exception as exc:
@@ -1384,7 +1419,9 @@ class DemoWorker(QThread, _WorkerMixin):
         return self._acquiring
 
     def _finish_recording(self, early: bool):
-        rec, self._recording = self._recording, None
+        rec = self._release_recording()
+        if rec is None:
+            return
         if rec.get("stream") is not None:
             self._finish_streamed(rec)
             return
@@ -1424,31 +1461,7 @@ class DemoWorker(QThread, _WorkerMixin):
                     camera_settings=settings,
                     display_settings=self._display_settings)
             else:
-                d = rec["path"]
-                d = d if d.suffix == "" else d.with_suffix("")
-                if not str(d).endswith("_seq"):
-                    d = Path(str(d) + "_seq")
-                d.mkdir(parents=True, exist_ok=True)
-                index = []
-                for i, arr in enumerate(rec["frames"]):
-                    fname = f"frame_{i:06d}.raw"
-                    (d / fname).write_bytes(np.ascontiguousarray(arr).tobytes(order="C"))
-                    index.append({"file": fname, **rec["metas"][i]})
-                first = rec["metas"][0] if rec["metas"] else {}
-                savers.write_sidecar(
-                    d / "sequence.json",
-                    savers.build_sidecar(
-                        image_info={"type": "raw_sequence", "frames": len(rec["frames"]),
-                                    "width": int(first.get("width", 0)),
-                                    "height": int(first.get("height", 0)),
-                                    "channels": 3 if (rec["frames"] and rec["frames"][0].ndim == 3) else 1,
-                                    "dtype": _raw_sequence_dtype(
-                                        first, 3 if (rec["frames"] and rec["frames"][0].ndim == 3) else 1),
-                                    "byte_order": "little"},
-                        frame_meta={"frames": index},
-                        camera_settings=settings,
-                        display_settings=self._display_settings))
-                out = d
+                out = self._write_raw_sequence(rec, settings)
             self.saveDone.emit({"ok": True, "path": str(out),
                                 "message": f"Recorded: {out}"})
         except Exception as exc:

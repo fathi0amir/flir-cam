@@ -11,6 +11,7 @@ dependencies = [
     "h5py>=3.11",
     "zarr>=3.0",
     "tifffile>=2024.8.30",
+    "pyarrow>=26.0.0",
 ]
 
 [project.optional-dependencies]

@@ -45,6 +45,18 @@ def test_full_recording_round_trips(fmt, ext, tmp_path):
         assert np.all(arr == i)
         assert meta["frame_id"] == i
 
+    # global-only sidecar + a parquet table with one row per frame
+    import json
+    from pathlib import Path
+
+    from flir_cam_gui import savers
+
+    sidecar_path = Path(str(result["path"]) + ".json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar["frame_metadata"]["rows"] == 16
+    rows = savers.read_frame_table(savers.frame_table_path(sidecar_path))
+    assert len(rows) == 16 and rows[-1]["frame_id"] == 15
+
 
 @pytest.mark.parametrize("fmt, ext", FORMATS)
 def test_early_stop_truncates(fmt, ext, tmp_path):

@@ -32,10 +32,12 @@ def _raw_sequence_dir(tmp_path: Path, n: int = 3, h: int = 4, w: int = 5) -> Pat
         (d / name).write_bytes(np.ascontiguousarray(arr).tobytes())
         index.append({"file": name, "frame_id": i, "width": w, "height": h,
                       "acquired_dtype": "uint16", "pixel_format": "Mono16"})
-    savers.write_sidecar(d / "sequence.json", savers.build_sidecar(
+    sidecar_path = d / "sequence.json"
+    table = savers.write_frame_metadata(sidecar_path, index)
+    savers.write_sidecar(sidecar_path, savers.build_sidecar(
         image_info={"type": "raw_sequence", "frames": n, "width": w, "height": h,
                     "channels": 1, "dtype": "uint16", "byte_order": "little"},
-        frame_meta={"frames": index}, camera_settings=SETTINGS))
+        camera_settings=SETTINGS, frame_table=table))
     return d
 
 
@@ -130,6 +132,29 @@ def test_zarr_sequence_and_frame_metadata(tmp_path):
     assert meta["frame_id"] == 2
 
 
+def test_legacy_inline_sidecar_still_reads(tmp_path):
+    """Schema 1 sidecars kept the per-frame rows inside the JSON."""
+    d = tmp_path / "legacy"
+    d.mkdir()
+    index = []
+    for i in range(2):
+        name = f"frame_{i:06d}.raw"
+        (d / name).write_bytes(np.full((2, 3), i, dtype=np.uint16).tobytes())
+        index.append({"file": name, "frame_id": i})
+    (d / "sequence.json").write_text(json.dumps({
+        "schema": 1,
+        "file": {"type": "raw_sequence", "width": 3, "height": 2,
+                 "channels": 1, "dtype": "uint16"},
+        "frame_metadata": {"frames": index},
+        "camera_settings": {},
+    }), encoding="utf-8")
+    info = describe_source(d)
+    assert info.n_frames == 2
+    assert info.frame_meta[1]["frame_id"] == 1
+    arr, meta = SequenceLoader(info).load(1)
+    assert np.all(arr == 1) and meta["frame_id"] == 1
+
+
 def test_describe_source_rejects_unknown_paths(tmp_path):
     with pytest.raises(FileNotFoundError):
         describe_source(tmp_path / "nope.raw")
@@ -203,6 +228,25 @@ def test_reader_tab_scrubs_and_plays(qapp, tmp_path):
                               "bit_depth": 12, "orientation": "rotate 90° CW"})
     assert tab.view.orientation == "rotate 90° CW"
     assert tab.view.displayed_size == (8, 10)   # 10 x 8 frame rotated
+
+
+def test_metadata_line_shows_global_exposure_and_gain(qapp, tmp_path):
+    """Exposure/gain are global settings, not per-frame columns."""
+    settings = {"camera": {"__type__": "category", "features": {
+        "ExposureTime": {"kind": "float", "value": 4500.0, "readable": True},
+        "Gain": {"kind": "float", "value": 2.5, "readable": True}}},
+        "stream": {}}
+    frames = [np.zeros((4, 5), dtype=np.uint16) for _ in range(2)]
+    metas = [{"frame_id": i, "saturated_fraction": 0.0} for i in range(2)]
+    out = savers.save_hdf5_sequence(tmp_path / "meta.h5", frames, metas,
+                                    pixel_format="Mono16", camera_settings=settings)
+    tab = FrameReaderTab()
+    assert tab.open_path(out) is True
+    tab._update_meta_text(1)
+    text = tab.lbl_meta.text()
+    assert "frame_id=1" in text
+    assert "exposure_time_us=4500.0" in text and "gain_db=2.5" in text
+    tab.close()
 
 
 def test_reader_tab_reports_bad_path(qapp, tmp_path, monkeypatch):

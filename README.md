@@ -21,7 +21,7 @@ A comprehensive Python GUI for **FLIR Spinnaker cameras** (PySpin), built with
   folder of raw frames, **HDF5** (`/image` or `/images`) or **Zarr** (`/image`)
   — with **play/pause**, playback speed, loop, a **scrubber** to jump to any
   frame, first/prev/next/last buttons, and the per-frame metadata
-  (frame id, exposure, gain, saturation) from the JSON sidecar. Frames are read
+  (frame id, exposure, gain, saturation) from the frame table. Frames are read
   **lazily**: opening a stack reads no pixels, and only the frame on screen is
   read, with rapid scrubbing collapsed into a single read of the final
   position.
@@ -31,8 +31,8 @@ A comprehensive Python GUI for **FLIR Spinnaker cameras** (PySpin), built with
   Values refresh periodically live (temperature, counters, etc.).
 - **Save the last frame several ways**:
   - `raw` binary plus a **JSON sidecar** with *every setting for that image*
-    (full node-map snapshot, per-frame metadata incl. chunk data, display
-    settings).
+    (full node-map snapshot, display settings) and a Parquet table with the
+    per-frame rows.
   - **HDF5** (`/image` dataset + `metadata` group attrs + flattened camera
     settings attrs `cam/...`) plus the same JSON sidecar.
   - **Zarr v3** store (`<name>.zarr`, `/image` array) compressed with
@@ -41,6 +41,8 @@ A comprehensive Python GUI for **FLIR Spinnaker cameras** (PySpin), built with
 - **Record sequences**: N frames into one **HDF5** file (`/images`, LZF
   compressed, chunked), one **Zarr** store (frames stacked on axis 0, one
   Blosc chunk per frame), or a folder of raw frames + `sequence.json` sidecar.
+  Every sequence writes its per-frame metadata to `<name>.frames.parquet`
+  (columnar, one row per frame) next to the JSON sidecar.
 - **Menu → File → Save settings snapshot** for the raw node map dump.
 
 The live camera view and the saved-image viewer are separate tabs, so browsing
@@ -124,7 +126,8 @@ hardware, and saturation fraction is reported in frame metadata.
 5. **Saved images** tab — *Open file...* for a `.raw`/`.h5`/`.hdf5` (or its
    `.json` sidecar) and *Open folder...* for a Zarr store or a folder of raw
    frames. Play/pause, drag the scrubber, or step with `|< < > >|`; the frame
-   metadata line shows what the sidecar recorded for that frame. *Orientation*,
+   metadata line shows what the per-frame Parquet table recorded for that frame.
+   *Orientation*,
    *Contrast* and *Palette* in the Display panel apply to this viewer too.
 6. **Display panel** — *Orientation* renders the frame as acquired, rotated
    (90° CW/CCW, 180°), flipped (horizontal/vertical) or transposed, for a
@@ -155,11 +158,172 @@ hardware, and saturation fraction is reported in frame metadata.
    (`.raw`, `.h5`, `.zarr`, `.npy`, `.tiff`, or `_seq` for a raw sequence) and
    the line below previews both targets. Nothing is overwritten: an existing
    name gets `_001`, `_002`, ... instead. When it saves an
-   image it **always writes a sidecar** (`<name>.json`) with:
+   image it **always writes a sidecar** (`<name>.json`) with the *global*
+   attributes:
    - `camera_settings` — full node maps (camera + stream),
-   - `frame_metadata` — frame ID, device/host timestamps, chunk exposure/gain,
    - `file` — geometry, dtype, byte order, byte count,
-   - `display_settings` — palette/bit-depth/levels used in the live view.
+   - `display_settings` — palette/bit-depth/levels used in the live view,
+   - `frame_metadata` — a reference to the per-frame table (see below).
+
+   Per-frame attributes (frame ID, device/host timestamps, saturation, and
+   the raw file name for raw sequences) are **not** stored in the JSON: they go
+   to a columnar **Parquet table beside it** — `<name>.json` →
+   `<name>.frames.parquet` (`sequence.json` → `sequence.frames.parquet` for raw
+   sequences). One row per frame, `frame_index` first:
+
+   ```python
+   import pyarrow.parquet as pq
+   t = pq.read_table("seq.h5.frames.parquet")
+   print(t.column_names)            # frame_index, frame_id, host_timestamp_s, ...
+   print(t.column("host_timestamp_s").to_pylist()[:3])
+   # or with DuckDB: SELECT frame_id, host_timestamp_s FROM 'seq.h5.frames.parquet'
+   ```
+
+   Values that are identical for every frame of a recording (`camera_model`,
+   `sensor`, `bit_depth`, `width`, `height`, `pixel_format`, `acquired_shape`,
+   `acquired_dtype`, `chunk`) are **not** repeated as columns; they live once in
+   the sidecar's `file` / `camera_settings`.
+
+   This keeps the sidecar constant-size: it holds only the globals (a few KB),
+   while every recorded frame used to add another JSON row. Measured: 3000
+   frames with three metadata fields each are ~293 KB of JSON, versus a ~0.5 KB
+   sidecar plus ~51 KB of Parquet. Sidecars from older versions that embed the
+   rows inline (`schema: 1`) are still read.
+
+### Sidecar data schema
+
+Every save writes two files: a JSON sidecar with the **global** attributes and a
+Parquet table with one **row per frame**.
+
+| data | file name |
+|---|---|
+| JSON sidecar | `<name>.json` — `frame.raw.json`, `seq.h5.json`, `seq.zarr.json`, … |
+| frame table | `<name>.frames.parquet` — `frame.raw.frames.parquet`, `seq.h5.frames.parquet`, … |
+| raw sequence | `sequence.json` + `sequence.frames.parquet` inside the `_seq` folder |
+
+#### JSON sidecar (`schema: 2`)
+
+Top-level keys (values abridged):
+
+```json
+{
+  "schema": 2,
+  "application": "flir-cam-gui",
+  "app_version": "0.1.0",
+  "host": "ILLab-DAFi",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "python": "3.12.9",
+  "saved_at_utc": "2026-10-28T09:23:09Z",
+  "file": {
+    "name": "seq.h5", "type": "hdf5_sequence",
+    "width": 1536, "height": 2048, "channels": 1,
+    "dtype": "uint16", "frames": 3, "pixel_format": "Mono16"
+  },
+  "frame_metadata": {"format": "parquet", "file": "seq.h5.frames.parquet", "rows": 3},
+  "camera_settings": {"camera": {"__type__": "category", "...": "..."},
+                       "stream": {"__type__": "category", "...": "..."}},
+  "display_settings": {"palette": "grayscale", "follow_mouse": false,
+                       "auto_levels": true, "bit_depth": 12, "auto_max_pct": 99.5,
+                       "levels": null, "orientation": "as acquired"}
+}
+```
+
+| key | type | meaning |
+|---|---|---|
+| `schema` | int | sidecar layout version, currently `2` |
+| `application` | string | always `flir-cam-gui` |
+| `app_version` | string | version that wrote the file |
+| `host` | string | machine name |
+| `platform` | string | OS string |
+| `python` | string | interpreter version |
+| `saved_at_utc` | string | `YYYY-MM-DDTHH:MM:SSZ` |
+| `file` | object | pixel payload description (see below) |
+| `frame_metadata` | object | pointer to the Parquet frame table |
+| `camera_settings` | object | GenICam node-map snapshot (`camera` + `stream`) |
+| `display_settings` | object | live-view settings; omitted when unknown |
+
+`frame_metadata` points at the table next to the JSON:
+
+| key | type | meaning |
+|---|---|---|
+| `format` | string | always `"parquet"` |
+| `file` | string | table file name (same folder as the JSON) |
+| `rows` | int | row count = number of frames |
+
+`file` always carries `name` (file-backed saves; not raw sequences),
+`type`, `width`, `height`, `channels` (3 for RGB), `dtype` and `pixel_format`,
+plus per-type keys:
+
+| `file.type` | extra keys |
+|---|---|
+| `raw_binary` | `byte_order`, `shape`, `bytes`, `description` |
+| `raw_sequence` | `frames`, `byte_order` (frames are separate `.raw` files, so no `name`/`shape`/`bytes`) |
+| `hdf5_single` | — |
+| `hdf5_sequence` | `frames` |
+| `zarr_single` | `format` (`zarr3`), `compressor` |
+| `zarr_sequence` | `frames`, `format`, `compressor` |
+| `npy` | `shape`, `bytes` |
+| `npy_sequence` | `shape`, `bytes`, `frames` |
+| `bigtiff` | `shape`, `bytes` |
+| `bigtiff_sequence` | `shape`, `bytes`, `frames` |
+
+`compressor` is `{"name": "blosc", "cname": "lz4"|"zstd", "clevel": 1-3, "shuffle": "shuffle"}`.
+
+`camera_settings` is the full node map as nested categories and leaves (one
+leaf shown; `name`/`tooltip` elided here):
+
+```json
+{"camera": {"__type__": "category", "display": "Root", "writable": false,
+             "features": {
+               "ExposureTime": {"kind": "float", "value": 5000.0,
+                                "min": 10.0, "max": 1000000.0, "unit": "us",
+                                "readable": true, "writable": true}}},
+ "stream": {"__type__": "category", "display": "Root (TLStream)",
+            "writable": false, "features": {}}}
+```
+
+Categories nest recursively via `features` and carry `__type__`, `display`,
+`writable` and `features`. Every leaf has `name`, `display`, `tooltip`,
+`readable`, `writable` and `kind` (`integer`, `float`, `boolean`,
+`enumeration`, `string`, `command` or `value`); leaves can also carry `value`,
+`min`/`max`/`inc`, `unit`, and for enumerations
+`entries: [{"symbolic": ..., "value": ..., "current": bool}]`.
+
+`display_settings` keys: `palette`, `follow_mouse`, `auto_levels`, `bit_depth`,
+`auto_max_pct`, `levels` (`null` in auto mode, else `[min, max]`) and
+`orientation`.
+
+#### Parquet frame table
+
+One row per recorded frame, Snappy-compressed, `frame_index` first:
+
+| column | Arrow type | null | meaning |
+|---|---|---|---|
+| `frame_index` | int64 | no | 0-based row number; for raw sequences it matches `frame_<index>.raw` |
+| `file` | string | yes | raw sequences only: the frame's `.raw` file name |
+| `frame_id` | int64 | yes | frame counter reported by the camera |
+| `device_timestamp_ns` | int64 | yes | timestamp reported by the device, ns |
+| `received_at_ns` | int64 | no | host receive time, ns since epoch |
+| `host_timestamp_s` | double | no | same instant in seconds since epoch |
+| `saturated_fraction` | double | yes | fraction of full-scale pixels (simulated cameras) |
+| `acquisition_fps` | double | yes | measured acquisition rate when the frame arrived |
+
+Any other per-frame key a backend adds becomes another column.
+
+These fields are **global** and are deliberately not repeated per row (they live
+in `file` / `camera_settings`): `camera_model`, `sensor`, `bit_depth`, `width`,
+`height`, `pixel_format`, `acquired_shape`, `acquired_dtype`, `chunk`.
+
+```python
+import pyarrow.parquet as pq
+
+t = pq.read_table("seq.h5.frames.parquet")
+print(t.schema)
+print(t.to_pandas().head())     # or: t.to_pylist()
+```
+
+Version note: `schema: 1` sidecars (older recordings) kept the per-frame rows
+inline under `frame_metadata.frames`; the GUI reads both layouts.
 
 ### Reading a raw file back
 

@@ -4,11 +4,12 @@ camera connected
 timers armed
 zarr single shape: (2048, 1536) uint16
 zarr seq dataset: (6, 2048, 1536)
-saves: [(True, 'frame_a.raw'), (True, 'frame_b.h5'), (True, 'frame_c.zarr'), (True, 'seq.zarr'), (True, 'seq_npy.npy'), (True, 'seq_tiff.tiff'), (True, 'seq_stream.hdf5')] frames: 36
-live view reported (1536, 2048) | hud:   5.6 fps  |  1536x2048  Mono16  #35
+saves: [(True, 'frame_a.raw'), (True, 'frame_b.h5'), (True, 'frame_c.zarr'), (True, 'seq.zarr'), (True, 'seq_npy.npy'), (True, 'seq_tiff.tiff'), (True, 'seq_stream.hdf5')] frames: 35
+frame table: frame_a.raw.frames.parquet 1 row(s), 2430 B; sidecar 7585 B
+live view reported (1536, 2048) | hud:   4.8 fps  |  1536x2048  Mono16  #34
 live view renders: 1032x699px, value spread 255
 live view aspect: 1536x2048 drawn as 420.7x560.9 px (ratio 0.7500 vs sensor 0.7500), pixel 3.65103 == 3.65103
-crosshair dragged during acquisition: [598.7, 901.8, 1201.2] | frame 39 | horizontal line stayed at 1000
+crosshair dragged during acquisition: [598.7, 901.8, 1201.2] | frame 38 | horizontal line stayed at 1000
 reader zarr sequence frame 0 ok (2048, 1536) 0 / 6
 reader seek ok 4 / 6
 reader playback ok, stopped at 5 / 6
@@ -22,4 +23,4 @@ bigtiff flag verified for seq_tiff.tiff
 reader streamed hdf5 stack ok 6
 histogram toggle ok
 ALL-GOOD
-after exec; frames= 41 saves= [(True, 'frame_a.raw'), (True, 'frame_b.h5'), (True, 'frame_c.zarr'), (True, 'seq.zarr'), (True, 'seq_npy.npy'), (True, 'seq_tiff.tiff'), (True, 'seq_stream.hdf5')]
+after exec; frames= 40 saves= [(True, 'frame_a.raw'), (True, 'frame_b.h5'), (True, 'frame_c.zarr'), (True, 'seq.zarr'), (True, 'seq_npy.npy'), (True, 'seq_tiff.tiff'), (True, 'seq_stream.hdf5')]

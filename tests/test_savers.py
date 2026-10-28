@@ -44,7 +44,11 @@ def test_raw_and_sidecar(tmp_path: Path):
     assert sidecar["file"]["dtype"] == "uint16"
     assert sidecar["file"]["width"] == 8 and sidecar["file"]["height"] == 6
     assert sidecar["file"]["bytes"] == arr.nbytes
-    assert sidecar["frame_metadata"]["frame_id"] == 7
+    assert sidecar["schema"] == 2
+    assert sidecar["frame_metadata"]["format"] == "parquet"
+    assert sidecar["frame_metadata"]["rows"] == 1
+    rows = savers.read_frame_table(Path(str(out) + ".frames.parquet"))
+    assert rows[0]["frame_id"] == 7
     assert "saved_at_utc" in sidecar
     assert sidecar["display_settings"]["palette"] == "grayscale"
     flat = savers.flatten_settings(SETTINGS)
@@ -89,7 +93,12 @@ def test_hdf5_sequence(tmp_path: Path):
     sc_path = out.with_suffix(out.suffix + ".json")
     sidecar = json.loads(sc_path.read_text(encoding="utf-8"))
     assert sidecar["file"]["frames"] == 3
-    assert sidecar["frame_metadata"]["frames"][1]["frame_id"] == 1
+    assert sidecar["frame_metadata"] == {"format": "parquet",
+                                         "file": "seq.hdf5.frames.parquet",
+                                         "rows": 3}
+    rows = savers.read_frame_table(out.with_name("seq.hdf5.frames.parquet"))
+    assert [r["frame_index"] for r in rows] == [0, 1, 2]
+    assert rows[1]["frame_id"] == 1
 
 
 def test_sequence_rejects_mixed_shapes(tmp_path):
@@ -126,7 +135,8 @@ def test_zarr_single(tmp_path: Path):
     assert side["file"]["type"] == "zarr_single"
     assert side["file"]["compressor"] == {"name": "blosc", "cname": "zstd",
                                           "clevel": 3, "shuffle": "shuffle"}
-    assert side["frame_metadata"]["frame_id"] == 7
+    table = savers.frame_table_path(Path(str(out) + ".json"))
+    assert savers.read_frame_table(table)[0]["frame_id"] == 7
 
 
 def test_zarr_sequence(tmp_path: Path):
@@ -148,6 +158,78 @@ def test_zarr_sequence(tmp_path: Path):
     side = json.loads(Path(str(out) + ".json").read_text(encoding="utf-8"))
     assert side["file"]["frames"] == 4
     assert side["file"]["compressor"]["cname"] == "lz4"
+
+
+# --- Frame metadata table (Parquet) -----------------------------------------
+
+def test_sidecar_holds_globals_only_and_frames_go_to_parquet(tmp_path: Path):
+    frames = [np.zeros((4, 5), dtype=np.uint16) for _ in range(4)]
+    metas = [{"frame_id": i, "width": 5, "height": 4, "host_timestamp_s": 10.5 + i,
+              "chunk": {"exposure_time_us": 1000.0 + i, "gain_db": 0.0}}
+             for i in range(4)]
+    out = savers.save_hdf5_sequence(tmp_path / "seq.h5", frames, metas,
+                                    pixel_format="Mono16", camera_settings=SETTINGS)
+    sidecar_path = out.with_suffix(out.suffix + ".json")
+    text = sidecar_path.read_text(encoding="utf-8")
+    sidecar = json.loads(text)
+
+    # global attributes only: no per-frame rows left in the JSON
+    assert sidecar["schema"] == 2
+    assert "host_timestamp_s" not in text and "exposure_time_us" not in text
+    assert sidecar["frame_metadata"] == {
+        "format": "parquet", "file": "seq.h5.frames.parquet", "rows": 4}
+
+    from flir_cam_gui.frame_reader import describe_source
+    info = describe_source(out)
+    assert len(info.frame_meta) == 4
+    assert info.frame_meta[2]["frame_id"] == 2
+    assert info.frame_meta[2]["host_timestamp_s"] == 12.5
+
+    # global-for-every-frame keys are not duplicated in the table
+    import pyarrow.parquet as pq
+    columns = pq.read_schema(savers.frame_table_path(sidecar_path)).names
+    for key in ("camera_model", "sensor", "bit_depth", "width", "height",
+                "pixel_format", "acquired_shape", "acquired_dtype", "chunk"):
+        assert key not in columns, key
+    assert columns[0] == "frame_index" and "frame_id" in columns
+
+
+def test_realistic_frame_meta_drops_every_global_column(tmp_path: Path):
+    """A camera-shaped meta dict keeps only genuinely per-frame columns."""
+    frames = [np.zeros((4, 5), dtype=np.uint16) for _ in range(2)]
+    metas = [{"camera_model": "BFS-U3-200S6M", "sensor": "Sony IMX183",
+              "bit_depth": 12, "width": 5, "height": 4,
+              "pixel_format": "Mono12", "acquired_shape": [4, 5],
+              "acquired_dtype": "uint16", "frame_id": i,
+              "device_timestamp_ns": 1000 + i, "host_timestamp_s": 5.0 + i,
+              "saturated_fraction": 0.0,
+              "chunk": {"exposure_time_us": 1000.0, "gain_db": 0.0,
+                        "timestamp": 1000 + i, "frame_id": i}}
+             for i in range(2)]
+    out = savers.save_hdf5_sequence(tmp_path / "real.h5", frames, metas,
+                                    pixel_format="Mono12", camera_settings=SETTINGS)
+    rows = savers.read_frame_table(savers.frame_table_path(
+        out.with_suffix(out.suffix + ".json")))
+    assert set(rows[0]) == {"frame_index", "frame_id", "device_timestamp_ns",
+                            "host_timestamp_s", "saturated_fraction"}
+    assert [r["frame_id"] for r in rows] == [0, 1]
+
+
+def test_frame_table_is_small_next_to_equivalent_json(tmp_path: Path):
+    """A few thousand frames must not inflate the sidecar."""
+    n = 2000
+    frames = [np.zeros((2, 2), dtype=np.uint8) for _ in range(n)]
+    metas = [{"frame_id": i, "host_timestamp_s": 1_700_000_000.123456,
+              "received_at_ns": 1_700_000_000_123_456_789 + i}
+             for i in range(n)]
+    out = savers.save_hdf5_sequence(tmp_path / "big.h5", frames, metas,
+                                    pixel_format="Mono8", camera_settings=SETTINGS)
+    sidecar_path = out.with_suffix(out.suffix + ".json")
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar_path.stat().st_size < 5000          # ~2 KB, was ~250 KB
+    assert sidecar["frame_metadata"]["rows"] == n
+    rows = savers.read_frame_table(savers.frame_table_path(sidecar_path))
+    assert len(rows) == n and rows[-1]["frame_id"] == n - 1
 
 
 @pytest.mark.parametrize("kw, err", [

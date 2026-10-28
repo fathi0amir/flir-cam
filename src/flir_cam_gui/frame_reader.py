@@ -94,9 +94,24 @@ def _read_sidecar(path: Path) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _sidecar_frames(sidecar: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Per-frame metadata: a list for stacks, or the lone frame's own dict."""
+def _sidecar_frames(sidecar: Dict[str, Any],
+                    folder: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """Per-frame metadata from the sidecar.
+
+    Schema 2 keeps it in a Parquet table next to the JSON sidecar (the global
+    attributes stay in the JSON); the older layout embedded the rows directly,
+    which is still read here so existing recordings keep opening.
+    """
     meta = sidecar.get("frame_metadata")
+    if isinstance(meta, dict) and meta.get("format") == "parquet":
+        name = meta.get("file")
+        if not name or folder is None:
+            return []
+        try:
+            from .savers import read_frame_table
+            return read_frame_table(Path(folder) / name)
+        except Exception:
+            return []
     if isinstance(meta, list):
         return [dict(m) for m in meta if isinstance(m, dict)]
     if isinstance(meta, dict):
@@ -105,6 +120,16 @@ def _sidecar_frames(sidecar: Dict[str, Any]) -> List[Dict[str, Any]]:
             return [dict(m) for m in frames if isinstance(m, dict)]
         return [dict(meta)] if meta else []
     return []
+
+
+def _global_setting_values(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Flattened camera settings keyed by feature name (``ExposureTime``)."""
+    from .savers import flatten_settings
+
+    values: Dict[str, Any] = {}
+    for key, value in flatten_settings(settings or {}).items():
+        values.setdefault(key.rsplit("/", 1)[-1], value)
+    return values
 
 
 def _dtype_from_sidecar(file_info: Dict[str, Any], frames: List[Dict[str, Any]]) -> str:
@@ -123,7 +148,7 @@ def _describe_tiff(path: Path) -> SequenceInfo:
     import tifffile
     sidecar = _read_sidecar(path)
     file_info = sidecar.get("file") or {}
-    frames = _sidecar_frames(sidecar)
+    frames = _sidecar_frames(sidecar, path.parent)
     with tifffile.TiffFile(path) as tf:
         if not tf.series:
             raise ValueError(f"{path.name}: no TIFF image series")
@@ -152,7 +177,7 @@ def _describe_tiff(path: Path) -> SequenceInfo:
 def _describe_numpy(path: Path) -> SequenceInfo:
     sidecar = _read_sidecar(path)
     file_info = sidecar.get("file") or {}
-    frames = _sidecar_frames(sidecar)
+    frames = _sidecar_frames(sidecar, path.parent)
     array = np.load(path, mmap_mode="r", allow_pickle=False)
     shape = tuple(array.shape)
     if len(shape) < 2:
@@ -201,7 +226,7 @@ def _describe_dir(d: Path) -> SequenceInfo:
 def _describe_raw_single(path: Path) -> SequenceInfo:
     sidecar = _read_sidecar(path)
     file_info = sidecar.get("file") or {}
-    frames = _sidecar_frames(sidecar)
+    frames = _sidecar_frames(sidecar, path.parent)
     dtype = _dtype_from_sidecar(file_info, frames)
     width = int(file_info.get("width") or (frames[0].get("width") if frames else 0) or 0)
     height = int(file_info.get("height") or (frames[0].get("height") if frames else 0) or 0)
@@ -224,7 +249,7 @@ def _describe_raw_dir(d: Path, raws: List[Path]) -> SequenceInfo:
         except Exception:
             sidecar = {}
     file_info = sidecar.get("file") or {}
-    frames = _sidecar_frames(sidecar)
+    frames = _sidecar_frames(sidecar, d)
     dtype = _dtype_from_sidecar(file_info, frames)
     width = int(file_info.get("width") or (frames[0].get("width") if frames else 0) or 0)
     height = int(file_info.get("height") or (frames[0].get("height") if frames else 0) or 0)
@@ -254,7 +279,7 @@ def _describe_hdf5(path: Path) -> SequenceInfo:
 
     sidecar = _read_sidecar(path)
     file_info = sidecar.get("file") or {}
-    frames = _sidecar_frames(sidecar)
+    frames = _sidecar_frames(sidecar, path.parent)
     with h5py.File(path, "r") as f:
         name = next((n for n in _DATASETS if n in f and hasattr(f[n], "shape")), None)
         if name is None:
@@ -297,7 +322,7 @@ def _describe_zarr(path: Path) -> SequenceInfo:
 
     sidecar = _read_sidecar(path)
     file_info = sidecar.get("file") or {}
-    frames = _sidecar_frames(sidecar)
+    frames = _sidecar_frames(sidecar, path.parent)
     root = zarr.open_group(store=LocalStore(root=path), mode="r")
     name = next((n for n in _DATASETS if n in root), None)
     if name is None:
@@ -481,6 +506,9 @@ class FrameReaderTab(QWidget):
         self._rate_hz = 10.0
         self._loop = True
         self._display_settings: Dict[str, Any] = {}
+        # camera settings that apply to the whole recording (exposure, gain);
+        # used by the metadata line now that they are not per-frame columns
+        self._global_values: Dict[str, Any] = {}
         self.view = LiveViewWidget()
 
         self._timer = QTimer(self)
@@ -599,6 +627,7 @@ class FrameReaderTab(QWidget):
         if self._loader is not None:
             self._loader.close()
         self._info = info
+        self._global_values = _global_setting_values(info.camera_settings)
         self._loader = SequenceLoader(info)
         self._index = 0
         self._play_index = 0
@@ -727,11 +756,15 @@ class FrameReaderTab(QWidget):
             return
         parts = [f"frame {idx} of {info.n_frames}", info.kind]
         meta = self._loader.meta_for(idx)
+        # exposure/gain are global camera settings, not per-frame columns
+        global_keys = {"exposure_time_us": "ExposureTime", "gain_db": "Gain"}
         for key in ("frame_id", "host_timestamp_s", "exposure_time_us", "gain_db",
                     "saturated_fraction"):
             value = meta.get(key)
             if value is None and isinstance(meta.get("chunk"), dict):
-                value = meta["chunk"].get(key)
+                value = meta["chunk"].get(key)      # legacy per-frame rows
+            if value is None and key in global_keys:
+                value = self._global_values.get(global_keys[key])
             if value is not None:
                 parts.append(f"{key}={value}")
         self.lbl_meta.setText("   ".join(str(p) for p in parts))
