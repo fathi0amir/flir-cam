@@ -14,8 +14,9 @@ from PyQt6.QtCore import Qt, QStandardPaths, QTimer, pyqtSlot
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDockWidget,
                              QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
                              QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-                             QPlainTextEdit, QPushButton, QScrollArea, QSlider,
-                             QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget)
+                             QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
+                             QSlider, QSpinBox, QSplitter, QTabWidget, QVBoxLayout,
+                             QWidget)
 
 from .camera import DEMO_MODELS, PYSPIN_AVAILABLE, CameraLister, create_worker
 from .live_view import ORIENTATIONS, PALETTES, LiveViewWidget
@@ -99,6 +100,9 @@ class MainWindow(QMainWindow):
         self._paint_timer = QTimer(self)
         self._paint_timer.setInterval(DISPLAY_INTERVAL_MS)
         self._paint_timer.timeout.connect(self._paint_pending)
+        self._record_progress_timer = QTimer(self)
+        self._record_progress_timer.setInterval(100)
+        self._record_progress_timer.timeout.connect(self._refresh_record_progress)
 
         # Start completely disconnected - user must manually connect
         if demo_default or not PYSPIN_AVAILABLE:
@@ -342,23 +346,16 @@ class MainWindow(QMainWindow):
         self.rec_btn = QPushButton("Record N frames")
         self.rec_btn.setEnabled(False)
         self.rec_btn.clicked.connect(self._toggle_record)
-        self.stream_chk = QCheckBox("Stream to disk while recording")
-        self.stream_chk.setToolTip(
-            "Write frames to disk in chunks while acquisition continues, "
-            "instead of holding every frame in RAM. Takes effect for "
-            "HDF5 / Zarr / NumPy / BigTIFF (raw sequences are per-frame files "
-            "already).")
-        self.stream_chunk = QSpinBox()
-        self.stream_chunk.setRange(1, 100000)
-        self.stream_chunk.setValue(32)
-        self.stream_chunk.setToolTip(
-            "Flush to disk every N frames (streaming only). Small values "
-            "lower peak RAM; large values amortize disk latency.")
+        self.rec_progress = QProgressBar()
+        self.rec_progress.setRange(0, 100)
+        self.rec_progress.setValue(0)
+        self.rec_progress.setFormat("Ready")
+        self.rec_progress.setVisible(False)
+        self.rec_progress.setAccessibleName("Recording progress")
         rec_form.addRow("Format:", self.rec_fmt_combo)
         rec_form.addRow("Frames:", self.rec_count)
         rec_form.addRow("Stack length (min:sec):", self.rec_duration)
-        rec_form.addRow("", self.stream_chk)
-        rec_form.addRow("Chunk size (frames):", self.stream_chunk)
+        rec_form.addRow("Progress:", self.rec_progress)
         right_lay.addWidget(rec_grp)
         right_lay.addStretch(1)
         # Without an explicit minimum the scroll area sizes the column below
@@ -559,11 +556,13 @@ class MainWindow(QMainWindow):
         self._refresh_timer.start()
         self._fps_timer.start()
         self._paint_timer.start()
+        self._record_progress_timer.start()
 
     def _disconnect_camera(self):
         self._refresh_timer.stop()
         self._fps_timer.stop()
         self._paint_timer.stop()
+        self._record_progress_timer.stop()
         self._pending_frame = None
         self._acq_fps = None
         self._frame_times.clear()
@@ -580,6 +579,7 @@ class MainWindow(QMainWindow):
         self.rec_btn.setEnabled(False)
         self._recording = False
         self.rec_btn.setText("Record N frames")
+        self.rec_progress.setVisible(False)
         self.live.clear_frame()
         self.lbl_state.setText("disconnected")
         self._sync_camera_picker()   # the picker may be used again
@@ -624,6 +624,35 @@ class MainWindow(QMainWindow):
         else:
             self._recording = False
             self.rec_btn.setText("Record N frames")
+
+    def _refresh_record_progress(self):
+        """Poll a small shared counter instead of queuing per-frame UI signals."""
+        worker = self.worker
+        progress_fn = getattr(worker, "recording_progress", None)
+        progress = progress_fn() if callable(progress_fn) else None
+        if progress is None:
+            if not self._recording:
+                self.rec_progress.setVisible(False)
+            return
+        total = int(progress["total"])
+        captured = int(progress["captured"])
+        remaining = int(progress["remaining"])
+        status = str(progress.get("status") or "recording")
+        if total <= 0:
+            return
+        self.rec_progress.setRange(0, total)
+        self.rec_progress.setValue(min(captured, total))
+        if status == "recording":
+            self.rec_progress.setFormat(
+                f"{max(0, remaining)} of {total} frames left")
+        elif status == "saving":
+            self.rec_progress.setFormat(
+                f"Writing {captured} of {total} frames to disk \u2026")
+        elif status == "complete":
+            self.rec_progress.setFormat(f"Complete ({captured} frames)")
+        else:
+            self.rec_progress.setFormat("Recording failed")
+        self.rec_progress.setVisible(True)
 
     @pyqtSlot(str)
     def _on_error(self, text: str):
@@ -1013,10 +1042,12 @@ class MainWindow(QMainWindow):
         self.worker.submit({
             "action": "record", "path": str(path), "n_frames": n, "fmt": fmt,
             "display_settings": self.current_display_settings(),
-            "blosc": self._blosc_params(),
-            "stream": self.stream_chk.isChecked(),
-            "chunk": self.stream_chunk.value()})
+            "blosc": self._blosc_params()})
         self._recording = True
+        self.rec_progress.setRange(0, n)
+        self.rec_progress.setValue(0)
+        self.rec_progress.setFormat(f"{n} of {n} frames left")
+        self.rec_progress.setVisible(True)
         self.rec_btn.setText(f"■ Stop recording (rec {n})")
 
     def _save_snapshot(self):
@@ -1040,10 +1071,25 @@ class MainWindow(QMainWindow):
         if result.get("ok"):
             self.log_line(result["message"])
             self.statusBar().showMessage(result["message"], 6000)
-            if str(result.get("message", "")).startswith(("Recorded", "Stopped")):
+            if result.get("kind") == "recording":
                 self._recording = False
+                self.rec_btn.setText("Record N frames")
+                progress_fn = getattr(self.worker, "recording_progress", None)
+                progress = progress_fn() if callable(progress_fn) else None
+                if progress and progress["total"]:
+                    total = int(progress["total"])
+                    captured = min(int(progress["captured"]), total)
+                    self.rec_progress.setRange(0, total)
+                    self.rec_progress.setValue(captured)
+                    self.rec_progress.setFormat(f"Complete ({captured} frames)")
+                self.rec_progress.setVisible(True)
         else:
-            self._recording = False
+            if result.get("kind") == "recording":
+                self._recording = False
+                self.rec_btn.setText("Record N frames")
+                self.rec_progress.setFormat("Recording failed")
+            else:
+                self.rec_progress.setVisible(False)
             self.log_line("SAVE FAILED: " + result.get("message", ""))
             QMessageBox.warning(self, "Save failed", result.get("message", ""))
 

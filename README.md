@@ -42,7 +42,10 @@ A comprehensive Python GUI for **FLIR Spinnaker cameras** (PySpin), built with
   compressed, chunked), one **Zarr** store (frames stacked on axis 0, one
   Blosc chunk per frame), or a folder of raw frames + `sequence.json` sidecar.
   Every sequence writes its per-frame metadata to `<name>.frames.parquet`
-  (columnar, one row per frame) next to the JSON sidecar.
+  (columnar, one row per frame) next to the JSON sidecar. Frames are handed to
+  a writer thread as they arrive, so saving never stalls acquisition, and the
+  **Recording** group shows a progress bar with the frames still to capture.
+  Stopping acquisition or disconnecting flushes all accepted frames to disk.
 - **Menu → File → Save settings snapshot** for the raw node map dump.
 
 The live camera view and the saved-image viewer are separate tabs, so browsing

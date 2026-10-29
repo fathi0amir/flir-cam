@@ -1,6 +1,8 @@
 """Streamed (chunked, off-thread) recording: all formats round-trip through
 the Saved-images reader, early stops truncate, and bad input reports failure."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -84,7 +86,38 @@ def test_shape_change_fails_the_recording(tmp_path):
 
 def test_unsupported_format_rejected(tmp_path):
     with pytest.raises(ValueError):
-        sr.StreamRecorder(tmp_path / "x.raw", "raw_sequence", 10)
+        sr.StreamRecorder(tmp_path / "x.png", "png_sequence", 10)
+
+
+def test_raw_sequence_is_written_frame_by_frame(tmp_path):
+    rec = sr.StreamRecorder(tmp_path / "raw", "raw_sequence", 3)
+    for i in range(3):
+        raw = np.full((2, 3), i, dtype=np.uint16).tobytes()
+        rec.add_raw(raw, None, {"frame_id": i, "pixel_format": "Mono16",
+                                "width": 3, "height": 2,
+                                "acquired_dtype": "uint16"})
+    result = rec.finish(pixel_format="Mono16", camera_settings=SETTINGS,
+                        display_settings=None, metas=[])
+    assert result["ok"], result
+    folder = Path(result["path"])
+    files = sorted(folder.glob("frame_*.raw"))
+    assert [f.name for f in files] == [f"frame_{i:06d}.raw" for i in range(3)]
+    assert np.frombuffer(files[2].read_bytes(), dtype=np.uint16).tolist() == [2] * 6
+    assert (folder / "sequence.json").exists()
+
+
+def test_submit_finish_reports_through_callbacks(tmp_path):
+    """Acquisition only enqueues; the writer delivers the result itself."""
+    rec = sr.StreamRecorder(tmp_path / "async.npy", "npy_sequence", 8)
+    rec.add(_frames(8))
+    results = []
+    rec.submit_finish(pixel_format="Mono16", camera_settings=SETTINGS,
+                      display_settings=None, metas=_metas(8),
+                      on_done=results.append)
+    rec.join()                                  # barrier for the test only
+    assert results and results[0]["ok"], results
+    assert results[0]["frames"] == 8
+    assert describe_source(results[0]["path"]).n_frames == 8
 
 
 def test_finish_without_frames_reports_error(tmp_path):

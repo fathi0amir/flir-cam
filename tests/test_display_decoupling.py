@@ -93,10 +93,40 @@ def test_recording_keeps_every_frame_while_display_coalesces(qapp, tmp_path):
         worker._publish_frame(arr, meta)
         worker._record_frame(arr, meta)
 
+    worker._wait_for_writers()                  # the writer reports completion
+    qapp.processEvents()                        # saveDone is queued to the GUI
     assert results and results[0]["ok"], results
     assert len(wakes) == 1                      # display coalesced ...
     from flir_cam_gui.frame_reader import describe_source
     assert describe_source(results[0]["path"]).n_frames == 6   # ... recording not
+
+
+def test_recording_reports_remaining_frames_and_completion(qapp, tmp_path):
+    worker = DemoWorker()
+    worker._recording = worker._make_recording(
+        str(tmp_path / "prog.npy"), 4, "npy_sequence", None)
+
+    progress = worker.recording_progress()
+    assert progress == {"total": 4, "captured": 0,
+                        "remaining": 4, "status": "recording"}
+
+    for fid in range(2):
+        arr = _frame(fid)
+        worker._record_frame(arr, dict(FRAME, frame_id=fid))
+    progress = worker.recording_progress()
+    assert progress["captured"] == 2 and progress["remaining"] == 2
+
+    for fid in range(2, 4):
+        arr = _frame(fid)
+        worker._record_frame(arr, dict(FRAME, frame_id=fid))
+    # The last frame hands the file to the writer thread; acquisition no
+    # longer waits for it.
+    assert worker.recording_progress()["status"] in ("saving", "complete")
+    assert isinstance(worker.recording_progress()["remaining"], int)
+    worker._wait_for_writers()
+    progress = worker.recording_progress()
+    assert progress["status"] == "complete"
+    assert progress["captured"] == 4 and progress["remaining"] == 0
 
 
 def test_worker_counts_frames_the_host_never_received(qapp):
@@ -142,6 +172,31 @@ def test_window_ignores_a_stale_frame_when_a_newer_one_is_waiting(window):
     win._on_frame(_frame(7), dict(FRAME, frame_id=7))   # stale queued frame
     win._paint_pending()
     assert painted == [9]
+
+
+def test_progress_bar_tracks_remaining_frames(window, tmp_path):
+    win = window
+    worker = DemoWorker()
+    win.worker = worker
+    worker._recording = worker._make_recording(
+        str(tmp_path / "bar.npy"), 4, "npy_sequence", None)
+
+    win._refresh_record_progress()
+    assert not win.rec_progress.isHidden()
+    assert win.rec_progress.format() == "4 of 4 frames left"
+
+    for fid in range(2):
+        worker._record_frame(_frame(fid), dict(FRAME, frame_id=fid))
+    win._refresh_record_progress()
+    assert win.rec_progress.value() == 2
+    assert win.rec_progress.format() == "2 of 4 frames left"
+
+    for fid in range(2, 4):
+        worker._record_frame(_frame(fid), dict(FRAME, frame_id=fid))
+    worker._wait_for_writers()
+    win._refresh_record_progress()
+    assert win.rec_progress.value() == 4
+    assert win.rec_progress.format() == "Complete (4 frames)"
 
 
 def test_fps_label_uses_the_acquisition_rate(window):

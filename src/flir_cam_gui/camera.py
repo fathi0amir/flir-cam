@@ -30,8 +30,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 from .stream_recorder import StreamRecorder
 
-#: formats whose frames can stream to disk while acquisition continues
-STREAM_FORMATS = ("hdf5_sequence", "zarr_sequence", "npy_sequence", "tiff_sequence")
+#: every sequence format streams to disk while acquisition continues
 SEQUENCE_FORMATS = ("hdf5_sequence", "raw_sequence", "zarr_sequence",
                     "npy_sequence", "tiff_sequence")
 
@@ -80,6 +79,13 @@ class _WorkerMixin:
         # Lives here (not in one backend) because _make_recording() and
         # _record_frame() in this mixin are shared by both workers.
         self._raw_needed = 0
+        self._recording_lock = threading.Lock()
+        # Small, coherent snapshot for the GUI progress timer.  Deliberately
+        # not the recording dict itself: that would pin every queued frame's
+        # metadata for the whole recording.
+        self._recording_progress: Optional[Dict[str, Any]] = None
+        self._writer_lock = threading.Lock()
+        self._writers: set = set()      # background save/finalize threads
 
     # -- frame hand-off (acquisition thread -> GUI thread) -------------------
     def _publish_frame(self, arr: np.ndarray, meta: Dict[str, Any]) -> None:
@@ -160,31 +166,38 @@ class _WorkerMixin:
         self._display_settings = dict(settings)
 
     def _make_recording(self, path: str, n_frames: int, fmt: str,
-                        blosc: Optional[Dict[str, Any]], stream: bool = False,
-                        chunk: int = 32) -> Dict[str, Any]:
-        """Recording state shared by both workers.
+                        blosc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create the state for one N-frame recording (both backends).
 
-        With ``stream=True`` (and a chunk-capable format) frames are handed to
-        a background ``StreamRecorder`` every ``chunk`` frames instead of
-        accumulating in ``frames``.  ``path`` becomes the format-suffixed
-        file this recording will produce.
+        Every sequence format streams: each frame is handed to a background
+        ``StreamRecorder`` and nothing accumulates in the acquisition loop.
+        ``path`` becomes the file (or raw folder) this recording produces.
         """
-        # Recording over an active one abandons it; release its raw-buffer
-        # request first, otherwise the counter would leak and the acquisition
-        # loop would keep copying raw buffers forever.
-        self._release_recording()
-        rec: Dict[str, Any] = {"path": Path(path), "fmt": fmt, "frames": [],
-                               "raws": [], "metas": [],
-                               "remaining": int(n_frames),
-                               "blosc": dict(blosc or {}),
-                               "pending": [], "chunk": max(1, int(chunk)),
-                               "stream": None}
-        if stream and fmt in STREAM_FORMATS:
-            rec["path"] = _sequence_output_path(rec["path"], fmt)
-            rec["stream"] = StreamRecorder(rec["path"], fmt, rec["remaining"],
-                                           rec["blosc"])
-        if fmt == "raw_sequence":
-            self._raw_needed += 1
+        # Recording over an active one finishes it first; that only enqueues a
+        # finish marker, so this cannot block the acquisition loop.
+        if getattr(self, "_recording", None) is not None:
+            self._finish_recording(early=True)
+        n_frames = int(n_frames)
+        if n_frames < 1:
+            raise ValueError("recording frame count must be positive")
+        prog = {"total": n_frames, "captured": 0,
+                "remaining": n_frames, "status": "recording"}
+        out = _sequence_output_path(Path(path), fmt)
+        rec: Dict[str, Any] = {"path": out, "fmt": fmt, "metas": [],
+                               "total": n_frames, "captured": 0,
+                               "remaining": n_frames, "progress": prog,
+                               "stream": StreamRecorder(out, fmt, n_frames,
+                                                        dict(blosc or {}))}
+        with self._recording_lock:
+            if fmt == "raw_sequence":
+                self._raw_needed += 1
+                if hasattr(self, "_raw_copy_warned"):
+                    self._raw_copy_warned = False
+            self._recording_progress = prog
+        # Tracked from the start so shutdown can drain a recording that is
+        # still in progress instead of leaving a blocked writer behind.
+        with self._writer_lock:
+            self._writers.add(rec["stream"])
         return rec
 
     def _release_recording(self) -> Optional[Dict[str, Any]]:
@@ -193,94 +206,132 @@ class _WorkerMixin:
         Both backends finish through here so the ``_raw_needed`` counter can
         never drift out of sync with ``_recording``.
         """
-        rec, self._recording = self._recording, None
-        if rec is not None and rec["fmt"] == "raw_sequence":
-            self._raw_needed = max(0, self._raw_needed - 1)
-        return rec
+        with self._recording_lock:
+            rec, self._recording = self._recording, None
+            if rec is None:
+                return None
+            if rec["fmt"] == "raw_sequence":
+                self._raw_needed = max(0, self._raw_needed - 1)
+            rec["progress"]["status"] = "saving"
+            return rec
 
     def _record_frame(self, arr: np.ndarray, meta: Dict[str, Any],
-                      raw: Optional[bytes] = None) -> None:
-        """Append one frame to the active recording (buffered or streaming)."""
+                      raw: Optional[bytes] = None,
+                      raw_fallback: bool = True) -> None:
+        """Hand one owned frame to the writer; the acquisition loop never writes.
+
+        ``arr`` (and ``raw``) must not be mutated or reused by the caller: they
+        are queued by reference and converted, stacked, compressed and written
+        on the recorder thread.  The cost here is one queue append per frame.
+        """
         rec = self._recording
         if rec is None:
             return
-        rec["metas"].append(meta)
+        frame_meta = dict(meta)
+        stream = rec["stream"]
         if rec["fmt"] == "raw_sequence":
-            if raw is None:
-                # A backend without a device buffer (the demo worker) hands
-                # over a synthetic array; its exact bytes are the raw frame.
-                raw = np.ascontiguousarray(arr).tobytes(order="C")
-            rec["raws"].append(raw)
-        elif rec.get("stream") is not None:
-            rec["pending"].append(arr.copy())
-            if len(rec["pending"]) >= rec["chunk"]:
-                rec["stream"].add(rec["pending"])
-                rec["pending"] = []
+            # A backend without a device buffer (the demo worker) hands over a
+            # synthetic array; its exact bytes *are* the raw frame, and the
+            # conversion happens on the writer thread, not here.
+            stream.add_raw(raw, arr if raw is None and raw_fallback else None,
+                           frame_meta)
         else:
-            rec["frames"].append(arr.copy())
+            stream.add([arr])
+        rec["metas"].append(frame_meta)
+        prog = rec["progress"]
+        rec["captured"] += 1
         rec["remaining"] -= 1
+        prog["captured"] = rec["captured"]
+        prog["remaining"] = rec["remaining"]
         if rec["remaining"] <= 0:
             self._finish_recording(early=False)
 
-    def _write_raw_sequence(self, rec: Dict[str, Any],
-                            settings: Dict[str, Any]) -> Path:
-        """Write a raw_sequence recording: one .raw per frame plus a sidecar.
+    def recording_progress(self) -> Optional[Dict[str, Any]]:
+        """Snapshot for the GUI's progress timer (cheap, thread-safe)."""
+        with self._recording_lock:
+            prog = self._recording_progress
+            return dict(prog) if prog is not None else None
 
-        Shared by both backends so the on-disk layout cannot drift between the
-        device buffer written by the camera worker and the synthetic frames
-        written by the demo worker.
+    def _finish_recording(self, early: bool) -> None:
+        """Detach the recording and let its writer thread close the file.
+
+        This only queues a finish marker, so it is safe to call from the
+        acquisition loop: the frames already handed over are still written in
+        order, and the completion result arrives through ``saveDone`` once the
+        file is closed.
         """
-        from . import savers
+        rec = self._release_recording()
+        if rec is None:
+            return
+        stream: StreamRecorder = rec["stream"]
+        prog = rec["progress"]
+        metas = list(rec["metas"])
+        pixel_format = (str(metas[0].get("pixel_format") or "unknown")
+                        if metas else "unknown")
+        # Snapshot on the camera thread: the writer must not touch GenICam.
+        settings = self.current_settings_snapshot()
+        display = dict(self._display_settings)
 
-        d = rec["path"]
-        d = d if d.suffix == "" else d.with_suffix("")
-        if not str(d).endswith("_seq"):
-            d = Path(str(d) + "_seq")
-        d.mkdir(parents=True, exist_ok=True)
-        first = rec["metas"][0] if rec["metas"] else {}
-        width, height = int(first.get("width", 0)), int(first.get("height", 0))
-        nchannels = 3 if (rec["raws"] and len(rec["raws"][0]) ==
-                          width * height * 3) else 1
-        index = []
-        for i, raw in enumerate(rec["raws"]):
-            fname = f"frame_{i:06d}.raw"
-            (d / fname).write_bytes(raw)
-            index.append({"file": fname, **rec["metas"][i]})
-        sidecar_path = d / "sequence.json"
-        table = savers.write_frame_metadata(sidecar_path, index)
-        savers.write_sidecar(
-            sidecar_path,
-            savers.build_sidecar(
-                image_info={"type": "raw_sequence", "frames": len(rec["raws"]),
-                            "width": width, "height": height,
-                            "channels": nchannels,
-                            "dtype": _raw_sequence_dtype(first, nchannels),
-                            "byte_order": "little"},
-                camera_settings=settings,
-                display_settings=self._display_settings,
-                frame_table=table))
-        return d
-
-    def _finish_streamed(self, rec: Dict[str, Any]) -> None:
-        """Flush the tail chunk and collect the streaming writer's result."""
-        stream = rec.get("stream")
-        try:
-            if stream is None:
-                raise RuntimeError("streamed recording lost its writer")
-            if rec["pending"]:
-                stream.add(rec["pending"])
-            pixel_format = (str(rec["metas"][0].get("pixel_format") or "unknown")
-                            if rec["metas"] else "unknown")
-            result = stream.finish(
-                pixel_format=pixel_format,
-                camera_settings=self.current_settings_snapshot(),
-                display_settings=self._display_settings,
-                metas=rec["metas"])
+        def done(result: Dict[str, Any]) -> None:
+            with self._recording_lock:
+                prog["status"] = "complete" if result.get("ok") else "failed"
+            with self._writer_lock:
+                self._writers.discard(stream)
+            result["kind"] = "recording"
+            result["total"] = rec["total"]
+            if early and result.get("ok"):
+                result["message"] = (
+                    f"Stopped after {rec['captured']} of {rec['total']} frames: "
+                    f"{result['path']}")
             self.saveDone.emit(result)
+            self.stateChanged.emit("acquiring" if self._is_acquiring() else "ready")
+
+        with self._writer_lock:
+            self._writers.add(stream)
+        try:
+            stream.submit_finish(
+                pixel_format=pixel_format, camera_settings=settings,
+                display_settings=display, metas=metas, on_done=done)
         except Exception as exc:
-            self.saveDone.emit({"ok": False, "path": str(rec["path"]),
+            with self._writer_lock:
+                self._writers.discard(stream)
+            with self._recording_lock:
+                prog["status"] = "failed"
+            self.saveDone.emit({"ok": False, "kind": "recording",
+                                "path": str(rec["path"]),
                                 "message": f"Record failed: {exc}"})
-        self.stateChanged.emit("acquiring" if self._is_acquiring() else "ready")
+
+    def _start_writer(self, target, name: str) -> None:
+        """Run *target* on its own thread, tracked so shutdown can drain it."""
+        def run():
+            try:
+                target()
+            finally:
+                with self._writer_lock:
+                    self._writers.discard(threading.current_thread())
+
+        writer = threading.Thread(target=run, name=name, daemon=False)
+        with self._writer_lock:
+            self._writers.add(writer)
+        writer.start()
+
+    def _wait_for_writers(self) -> None:
+        """Block until every accepted save/recording has been flushed.
+
+        Only used when acquisition is already stopped (disconnect/exit), so a
+        closed file - and its sidecar - always reflects all captured frames.
+        An unfinished recording is finalized first; otherwise its writer would
+        wait forever for a finish marker and hold the process open.
+        """
+        if getattr(self, "_recording", None) is not None:
+            self._finish_recording(early=True)
+        while True:
+            with self._writer_lock:
+                writers = tuple(self._writers)
+            if not writers:
+                return
+            for writer in writers:
+                writer.join()
 
     def _is_acquiring(self) -> bool:
         raise NotImplementedError
@@ -288,17 +339,37 @@ class _WorkerMixin:
     def _do_save_last(self, path: str, fmt: str, include_sidecar: bool = True,
                       display_settings: Optional[Dict[str, Any]] = None,
                       blosc: Optional[Dict[str, Any]] = None):
-        """Persist the most recent frame."""
+        """Persist the most recent frame on a writer thread (never on capture)."""
         try:
             if display_settings:
                 self._display_settings = dict(display_settings)
             if self._last_frame is None:
                 raise RuntimeError("No frame captured yet (start acquisition first)")
             arr, meta = self._last_frame
-            out = self._save_current(path, fmt, arr, meta, include_sidecar, blosc)
-            self.saveDone.emit({"ok": True, "path": str(out), "message": f"Saved {out}"})
+            # Snapshot here, on the camera thread: the writer must not read the
+            # GenICam node map, and the frame array is immutable once stored.
+            frame_meta = dict(meta)
+            settings = self.current_settings_snapshot()
+            display = dict(self._display_settings)
+            blosc_args = dict(blosc or {})
+
+            def save() -> None:
+                try:
+                    out = self._save_current(
+                        path, fmt, arr, frame_meta, include_sidecar,
+                        blosc=blosc_args, camera_settings=settings,
+                        display_settings=display)
+                    self.saveDone.emit({"ok": True, "kind": "save",
+                                        "path": str(out),
+                                        "message": f"Saved {out}"})
+                except Exception as exc:
+                    self.saveDone.emit({"ok": False, "kind": "save",
+                                        "path": path, "message": str(exc)})
+
+            self._start_writer(save, f"save-{Path(path).name}")
         except Exception as exc:
-            self.saveDone.emit({"ok": False, "path": path, "message": str(exc)})
+            self.saveDone.emit({"ok": False, "kind": "save",
+                                "path": path, "message": str(exc)})
 
     @property
     def last_frame(self):
@@ -316,9 +387,14 @@ class _WorkerMixin:
                 self.error.emit(f"Command failed: {exc}\n{traceback.format_exc(limit=3)}")
 
     def _save_current(self, path: str, fmt: str, arr, meta, include_sidecar=True,
-                      blosc: Optional[Dict[str, Any]] = None):
+                      blosc: Optional[Dict[str, Any]] = None,
+                      camera_settings: Optional[Dict[str, Any]] = None,
+                      display_settings: Optional[Dict[str, Any]] = None):
         from . import savers
-        settings = self.current_settings_snapshot()
+        settings = (self.current_settings_snapshot() if camera_settings is None
+                    else camera_settings)
+        display = (self._display_settings if display_settings is None
+                   else display_settings)
         pixel_format = str((meta or {}).get("pixel_format") or arr.dtype)
         blosc_args = dict(blosc or {})
         blosc_args.setdefault("blosc_cname", "lz4")
@@ -331,14 +407,14 @@ class _WorkerMixin:
             savers.save_raw_with_sidecar(
                 out, arr, pixel_format=pixel_format, frame_meta=meta,
                 camera_settings=settings,
-                display_settings=self._display_settings)
+                display_settings=display)
             return out
         if fmt == "hdf5":
             out = path if str(path).endswith((".h5", ".hdf5")) else Path(str(path) + ".h5")
             savers.save_hdf5(
                 out, arr, pixel_format=pixel_format, frame_meta=meta,
                 camera_settings=settings,
-                display_settings=self._display_settings,
+                display_settings=display,
                 include_sidecar=include_sidecar)
             return out
         if fmt == "zarr":
@@ -346,7 +422,7 @@ class _WorkerMixin:
             savers.save_zarr(
                 out, arr, pixel_format=pixel_format, frame_meta=meta,
                 camera_settings=settings,
-                display_settings=self._display_settings,
+                display_settings=display,
                 include_sidecar=include_sidecar, **blosc_args)
             return out
         if fmt == "npy":
@@ -356,7 +432,7 @@ class _WorkerMixin:
             savers.save_npy(
                 out, arr, pixel_format=pixel_format, frame_meta=meta,
                 camera_settings=settings,
-                display_settings=self._display_settings,
+                display_settings=display,
                 include_sidecar=include_sidecar)
             return out
         if fmt == "tiff":
@@ -366,7 +442,7 @@ class _WorkerMixin:
             savers.save_tiff(
                 out, arr, pixel_format=pixel_format, frame_meta=meta,
                 camera_settings=settings,
-                display_settings=self._display_settings,
+                display_settings=display,
                 include_sidecar=include_sidecar)
             return out
         raise ValueError(f"Unknown save format {fmt}")
@@ -493,6 +569,7 @@ class CameraWorker(QThread, _WorkerMixin):
         self._pixel_key = object()
         self._direct_pixels: Optional[bool] = None
         self._processor = None
+        self._raw_copy_warned = False
 
     # -- lifecycle ---------------------------------------------------------
     def stop(self) -> None:
@@ -584,7 +661,9 @@ class CameraWorker(QThread, _WorkerMixin):
         except Exception:
             pass
         # Every handle into the camera has to be gone before the list and
-        # system instance are released (see _release_spinnaker).
+        # system instance are released (see _release_spinnaker).  Pending
+        # writes are drained first so no recorded frame is lost on exit.
+        self._wait_for_writers()
         self._processor = None
         self._direct_pixels = None
         self.cam = None
@@ -704,21 +783,20 @@ class CameraWorker(QThread, _WorkerMixin):
 
     def _do_record(self, path: str, n_frames: int, fmt: str,
                    display_settings: Optional[Dict[str, Any]] = None,
-                   blosc: Optional[Dict[str, Any]] = None,
-                   stream: bool = False, chunk: int = 32):
+                   blosc: Optional[Dict[str, Any]] = None):
         if display_settings:
             self._display_settings = dict(display_settings)
         if not self.acquiring:
-            self.saveDone.emit({"ok": False, "path": path,
+            self.saveDone.emit({"ok": False, "kind": "recording", "path": path,
                                 "message": "Start acquisition before recording"})
             return
         if fmt not in SEQUENCE_FORMATS:
-            self.saveDone.emit({"ok": False, "path": path, "message": f"bad fmt {fmt}"})
+            self.saveDone.emit({"ok": False, "kind": "recording", "path": path,
+                                "message": f"bad fmt {fmt}"})
             return
-        self._recording = self._make_recording(path, n_frames, fmt, blosc,
-                                               stream=stream, chunk=chunk)
-        self.log.emit(f"Recording {n_frames} frames to {path} "
-                      f"({'streamed' if self._recording.get('stream') else 'buffered'}) ...")
+        self._recording = self._make_recording(path, n_frames, fmt, blosc)
+        self.log.emit(f"Recording {n_frames} frames to "
+                      f"{self._recording['path']} ...")
         self.stateChanged.emit("recording")
 
     def _do_stop_record(self):
@@ -768,7 +846,12 @@ class CameraWorker(QThread, _WorkerMixin):
                 except Exception:
                     raw = None
             self._publish_frame(arr, meta)
-            self._record_frame(arr, meta, raw)
+            if self._raw_needed > 0 and raw is None and not self._raw_copy_warned:
+                self._raw_copy_warned = True
+                self.error.emit(
+                    "Raw recording: the camera buffer could not be copied; "
+                    "the recording will be reported as failed")
+            self._record_frame(arr, meta, raw, raw_fallback=False)
         finally:
             try:
                 image.Release()
@@ -849,58 +932,6 @@ class CameraWorker(QThread, _WorkerMixin):
     def _is_acquiring(self) -> bool:
         return self.acquiring
 
-    def _finish_recording(self, early: bool):
-        rec = self._release_recording()
-        if rec is None:
-            return
-        if rec.get("stream") is not None:
-            self._finish_streamed(rec)
-            return
-        try:
-            from . import savers
-            settings = self.current_settings_snapshot()
-            blosc = dict(rec.get("blosc") or {})
-            blosc.setdefault("blosc_cname", "lz4")
-            blosc.setdefault("blosc_clevel", 1)
-            blosc.setdefault("blosc_shuffle", "shuffle")
-            pixel_format = str(rec["metas"][0].get("pixel_format") or "unknown") if rec["metas"] else "unknown"
-            if rec["fmt"] == "hdf5_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_hdf5_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=pixel_format,
-                    camera_settings=settings,
-                    display_settings=self._display_settings)
-            elif rec["fmt"] == "zarr_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_zarr_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=pixel_format,
-                    camera_settings=settings,
-                    display_settings=self._display_settings, **blosc)
-            elif rec["fmt"] == "npy_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_npy_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=pixel_format,
-                    camera_settings=settings,
-                    display_settings=self._display_settings)
-            elif rec["fmt"] == "tiff_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_tiff_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=pixel_format,
-                    camera_settings=settings,
-                    display_settings=self._display_settings)
-            else:  # raw_sequence -> folder of .raw files + sidecar
-                out = self._write_raw_sequence(rec, settings)
-            msg = f"Recorded: {out}"
-            self.saveDone.emit({"ok": True, "path": str(out), "message": msg})
-        except Exception as exc:
-            self.saveDone.emit({"ok": False, "path": str(rec["path"]),
-                                "message": f"Record failed: {exc}"})
-        self.stateChanged.emit("acquiring" if self.acquiring else "ready")
-
 
 # ===========================================================================
 # PySpin node snapshot helpers
@@ -916,15 +947,11 @@ def _sequence_output_path(path: Path, fmt: str) -> Path:
         return path.with_suffix(".npy")
     if fmt == "tiff_sequence" and path.suffix.lower() not in (".tif", ".tiff"):
         return path.with_suffix(".tiff")
+    if fmt == "raw_sequence":
+        # Raw recordings are a folder of per-frame .raw files.
+        path = path.with_suffix("") if path.suffix else path
+        return path if str(path).endswith("_seq") else Path(str(path) + "_seq")
     return path
-
-
-def _raw_sequence_dtype(meta: Optional[Dict[str, Any]], channels: int) -> str:
-    """Pixel dtype of a raw sequence, so the sidecar is self-describing."""
-    dtype = (meta or {}).get("acquired_dtype")
-    if dtype:
-        return str(dtype)
-    return "uint8" if int(channels) > 1 else "uint16"
 
 
 def describe_node(node) -> Optional[Dict[str, Any]]:
@@ -1240,6 +1267,11 @@ class DemoWorker(QThread, _WorkerMixin):
                     time.sleep(remaining)
             else:
                 time.sleep(0.02)
+        # Flush accepted frames before reporting the disconnect: a stopped
+        # acquisition always leaves a complete file and sidecar behind.
+        if self._recording is not None:
+            self._finish_recording(early=True)
+        self._wait_for_writers()
         self.stateChanged.emit("disconnected")
 
     def refresh_tree(self):
@@ -1394,21 +1426,20 @@ class DemoWorker(QThread, _WorkerMixin):
 
     def _do_record(self, path: str, n_frames: int, fmt: str,
                    display_settings: Optional[Dict[str, Any]] = None,
-                   blosc: Optional[Dict[str, Any]] = None,
-                   stream: bool = False, chunk: int = 32):
+                   blosc: Optional[Dict[str, Any]] = None):
         if display_settings:
             self._display_settings = dict(display_settings)
         if not self._acquiring:
-            self.saveDone.emit({"ok": False, "path": path,
+            self.saveDone.emit({"ok": False, "kind": "recording", "path": path,
                                 "message": "Start acquisition before recording"})
             return
         if fmt not in SEQUENCE_FORMATS:
-            self.saveDone.emit({"ok": False, "path": path, "message": f"bad fmt {fmt}"})
+            self.saveDone.emit({"ok": False, "kind": "recording", "path": path,
+                                "message": f"bad fmt {fmt}"})
             return
-        self._recording = self._make_recording(path, n_frames, fmt, blosc,
-                                               stream=stream, chunk=chunk)
-        self.log.emit(f"Recording {n_frames} frames to {path} "
-                      f"({'streamed' if self._recording.get('stream') else 'buffered'}) ...")
+        self._recording = self._make_recording(path, n_frames, fmt, blosc)
+        self.log.emit(f"Recording {n_frames} frames to "
+                      f"{self._recording['path']} ...")
         self.stateChanged.emit("recording")
 
     def _do_stop_record(self):
@@ -1417,57 +1448,6 @@ class DemoWorker(QThread, _WorkerMixin):
 
     def _is_acquiring(self) -> bool:
         return self._acquiring
-
-    def _finish_recording(self, early: bool):
-        rec = self._release_recording()
-        if rec is None:
-            return
-        if rec.get("stream") is not None:
-            self._finish_streamed(rec)
-            return
-        try:
-            from . import savers
-            settings = self.current_settings_snapshot()
-            blosc = dict(rec.get("blosc") or {})
-            blosc.setdefault("blosc_cname", "lz4")
-            blosc.setdefault("blosc_clevel", 1)
-            blosc.setdefault("blosc_shuffle", "shuffle")
-            if rec["fmt"] == "hdf5_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_hdf5_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=str(rec["metas"][0].get("pixel_format") or "unknown"),
-                    camera_settings=settings,
-                    display_settings=self._display_settings)
-            elif rec["fmt"] == "zarr_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_zarr_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=str(rec["metas"][0].get("pixel_format") or "unknown"),
-                    camera_settings=settings,
-                    display_settings=self._display_settings, **blosc)
-            elif rec["fmt"] == "npy_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_npy_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=str(rec["metas"][0].get("pixel_format") or "unknown"),
-                    camera_settings=settings,
-                    display_settings=self._display_settings)
-            elif rec["fmt"] == "tiff_sequence":
-                out = _sequence_output_path(rec["path"], rec["fmt"])
-                savers.save_tiff_sequence(
-                    out, rec["frames"], rec["metas"],
-                    pixel_format=str(rec["metas"][0].get("pixel_format") or "unknown"),
-                    camera_settings=settings,
-                    display_settings=self._display_settings)
-            else:
-                out = self._write_raw_sequence(rec, settings)
-            self.saveDone.emit({"ok": True, "path": str(out),
-                                "message": f"Recorded: {out}"})
-        except Exception as exc:
-            self.saveDone.emit({"ok": False, "path": str(rec["path"]),
-                                "message": f"Record failed: {exc}"})
-        self.stateChanged.emit("acquiring" if self._acquiring else "ready")
 
 
 def create_worker(demo: bool = False, serial: Optional[str] = None,

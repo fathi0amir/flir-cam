@@ -59,11 +59,9 @@ def on_done(res):
                            "display_settings": {}, **rec_kwargs})
 
 
-def queue_next_stack(fmt, path, stream=False, chunk=0):
+def queue_next_stack(fmt, path):
     """Queue a stack recording that starts when the current one writes out."""
     entry = {"fmt": fmt, "path": path}
-    if stream:
-        entry.update(stream=True, chunk=chunk)
     state["next_seq"] = (state.get("next_seq") or []) + [entry]
 
 
@@ -91,9 +89,9 @@ QTimer.singleShot(1200, save_and_record)
 # stack; on_done chains them since the worker records one sequence at a time.
 queue_next_stack("npy_sequence", str(out / "seq_npy"))
 queue_next_stack("tiff_sequence", str(out / "seq_tiff"))
-# The streaming feature: chunks of 2 frames piped to the writer thread while
-# the demo camera keeps grabbing.
-queue_next_stack("hdf5_sequence", str(out / "seq_stream"), stream=True, chunk=2)
+# Every stack format streams through the writer thread while the demo camera
+# keeps grabbing.
+queue_next_stack("hdf5_sequence", str(out / "seq_stream"))
 p("timers armed")
 
 def check_and_finish():

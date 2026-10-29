@@ -87,6 +87,8 @@ def test_demo_records_raw_sequence(qapp, tmp_path):
         arr, meta = worker._make_frame()
         worker._record_frame(arr, meta)
 
+    worker._wait_for_writers()              # files are closed on the writer
+    qapp.processEvents()                    # saveDone is queued to the GUI
     assert results and results[0]["ok"], results
     assert worker._raw_needed == 0          # released when the recording ends
 
@@ -110,6 +112,22 @@ def test_demo_records_raw_sequence(qapp, tmp_path):
     assert info.n_frames == 4
 
 
+def test_save_last_runs_on_a_writer_thread(qapp, tmp_path):
+    """A snapshot save must not run on the acquisition thread."""
+    worker = DemoWorker()
+    arr, meta = worker._make_frame()
+    worker._publish_frame(arr, meta)
+    results = []
+    worker.saveDone.connect(results.append)
+
+    worker._do_save_last(str(tmp_path / "snap"), "npy")
+    worker._wait_for_writers()
+    qapp.processEvents()
+    assert results and results[0]["ok"], results
+    assert results[0]["kind"] == "save"
+    assert Path(results[0]["path"]).exists()
+
+
 def test_demo_raw_record_releases_counter_when_stopped_early(qapp, tmp_path):
     worker = DemoWorker()
     worker._do_start_acquisition()
@@ -118,6 +136,7 @@ def test_demo_raw_record_releases_counter_when_stopped_early(qapp, tmp_path):
     worker._record_frame(arr, meta)
     worker._do_stop_acquisition()                  # finish with frames missing
     assert worker._raw_needed == 0
+    worker._wait_for_writers()
 
 
 def test_second_record_request_does_not_leak_raw_counter(qapp, tmp_path):
@@ -127,6 +146,8 @@ def test_second_record_request_does_not_leak_raw_counter(qapp, tmp_path):
     worker._do_record(str(tmp_path / "b"), 5, "hdf5_sequence", None)
     assert worker._raw_needed == 0
     assert worker._recording["fmt"] == "hdf5_sequence"
+    worker._do_stop_record()
+    worker._wait_for_writers()
 
 
 # ---------------------------------------------------------------------------

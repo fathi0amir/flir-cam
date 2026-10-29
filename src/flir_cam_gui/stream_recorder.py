@@ -19,7 +19,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -208,23 +208,81 @@ class _TiffAppender(_Appender):
         return self.path
 
 
+class _RawSequenceAppender:
+    """Incrementally write per-frame raw files and sidecar metadata."""
+
+    def __init__(self, path: Path, n_frames: int, blosc: Dict[str, Any]):
+        directory = Path(path)
+        directory = directory if directory.suffix == "" else directory.with_suffix("")
+        if not str(directory).endswith("_seq"):
+            directory = Path(str(directory) + "_seq")
+        self.path = directory
+        self.path.mkdir(parents=True, exist_ok=True)
+        self.count = 0
+        self.index: List[Dict[str, Any]] = []
+
+    def add_raw(self, raw: Optional[bytes], frame: Optional[np.ndarray],
+                meta: Dict[str, Any]) -> None:
+        name = f"frame_{self.count:06d}.raw"
+        if raw is None:
+            if frame is None:
+                raise ValueError("raw frame has no data")
+            raw = np.ascontiguousarray(frame).tobytes(order="C")
+        with (self.path / name).open("wb") as stream:
+            stream.write(raw)
+        self.index.append({"file": name, **meta})
+        self.count += 1
+
+    def finish(self, pixel_format: str, camera_settings: Dict[str, Any],
+               display_settings: Optional[Dict[str, Any]],
+               metas: Sequence[Dict[str, Any]]) -> Path:
+        if not self.index:
+            raise RuntimeError("recording stopped with no frames")
+        first = self.index[0]
+        width, height = int(first.get("width", 0)), int(first.get("height", 0))
+        first_frame = self.path / "frame_000000.raw"
+        raw_size = first_frame.stat().st_size if first_frame.exists() else 0
+        channels = 3 if width and height and raw_size == width * height * 3 else 1
+        sidecar_path = self.path / "sequence.json"
+        table = savers.write_frame_metadata(sidecar_path, self.index)
+        dtype = first.get("acquired_dtype") or ("uint8" if channels == 3 else "uint16")
+        savers.write_sidecar(
+            sidecar_path,
+            savers.build_sidecar(
+                image_info={"type": "raw_sequence", "frames": self.count,
+                            "width": width, "height": height,
+                            "channels": channels, "dtype": str(dtype),
+                            "byte_order": "little"},
+                camera_settings=camera_settings,
+                display_settings=display_settings, frame_table=table))
+        return self.path
+
+
 _APPENDERS = {"hdf5_sequence": _Hdf5Appender, "zarr_sequence": _ZarrAppender,
-              "npy_sequence": _NpyAppender, "tiff_sequence": _TiffAppender}
+              "npy_sequence": _NpyAppender, "tiff_sequence": _TiffAppender,
+              "raw_sequence": _RawSequenceAppender}
 
 
 class StreamRecorder(threading.Thread):
-    """Background chunk writer; acquisition never waits for disk.
+    """Background writer; acquisition only enqueues frames.
 
-    The acquirer calls :meth:`add` (one chunk of frames) and finally
-    :meth:`finish`.  Results are exactly like the buffered writers:
-    ``{"ok": bool, "path": str, "message": str}``.
+    The acquirer calls :meth:`add` / :meth:`add_raw` once per frame and finally
+    :meth:`submit_finish`, which only queues a marker.  Conversion, stacking,
+    compression and disk I/O all happen on this thread; the completion result
+    (same shape as the single-frame writers in ``savers``) is delivered through
+    ``on_done`` and :meth:`result`.
     """
 
     def __init__(self, path: Path, fmt: str, n_frames: int,
                  blosc: Optional[Dict[str, Any]] = None):
-        super().__init__(daemon=True, name=f"streamWriter-{Path(path).name}")
+        # Deliberately not a daemon: a writer still draining when the process
+        # exits must be allowed to finish the frames it already accepted.
+        super().__init__(daemon=False, name=f"streamWriter-{Path(path).name}")
         if fmt not in _APPENDERS:
             raise ValueError(f"streaming is not supported for {fmt}")
+        # N-frame recordings have a finite, user-selected lifetime. Keep the
+        # handoff lossless and non-blocking; a bounded queue would stall camera
+        # acquisition whenever disk throughput temporarily falls behind.
         self._q: "queue.Queue[tuple]" = queue.Queue()
         self._results: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self._appender_cls = _APPENDERS[fmt]
@@ -233,21 +291,45 @@ class StreamRecorder(threading.Thread):
         self._n_frames = int(n_frames)
         self._blosc = dict(blosc or {})
         self._error: Optional[BaseException] = None
-        self._extra: Dict[str, Any] = {}   # finished-file details for result
+        self._on_done: Optional[Callable[[Dict[str, Any]], None]] = None
         self.start()
 
     # -- producer side (acquisition thread) ---------------------------------
     def add(self, frames: Sequence[np.ndarray]) -> None:
-        self._q.put(("add", [np.ascontiguousarray(a) for a in frames]))
+        # Keep the original owned frame references: conversion/stacking belongs
+        # to this consumer thread. An unbounded queue prevents disk stalls from
+        # backpressuring capture; N is finite and determines the worst-case
+        # retained frame memory if the writer cannot keep up.
+        self._q.put(("add", list(frames)))
+
+    def add_raw(self, raw: Optional[bytes], frame: Optional[np.ndarray],
+                meta: Dict[str, Any]) -> None:
+        """Queue one raw frame so acquisition never writes the frame file."""
+        self._q.put(("raw", raw, frame, dict(meta)))
+
+    def submit_finish(self, *, pixel_format: str,
+                      camera_settings: Dict[str, Any],
+                      display_settings: Optional[Dict[str, Any]],
+                      metas: Sequence[Dict[str, Any]],
+                      on_done: Optional[Callable[[Dict[str, Any]], None]] = None
+                      ) -> None:
+        """Queue the finish marker and return at once (acquisition-safe).
+
+        Queue ordering guarantees every previously submitted frame is written
+        before the file is closed, so nothing captured is dropped.  *on_done*
+        runs on this writer thread once the file and sidecar are complete.
+        """
+        self._on_done = on_done
+        self._q.put(("finish", pixel_format, camera_settings,
+                     display_settings, list(metas)))
 
     def finish(self, *, pixel_format: str, camera_settings: Dict[str, Any],
                display_settings: Optional[Dict[str, Any]],
                metas: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-        # Queue ordering guarantees every previously submitted chunk is
-        # consumed before the finish marker.  Join before reporting completion
-        # so acquisition shutdown cannot race the final disk writes/close.
-        self._q.put(("finish", pixel_format, camera_settings,
-                     display_settings, list(metas)))
+        """Blocking barrier form of :meth:`submit_finish` (tests, CLI)."""
+        self.submit_finish(pixel_format=pixel_format,
+                           camera_settings=camera_settings,
+                           display_settings=display_settings, metas=metas)
         self.join()
         return self.result()
 
@@ -261,6 +343,7 @@ class StreamRecorder(threading.Thread):
     # -- consumer side (writer thread) ---------------------------------------
     def run(self) -> None:
         appender: Optional[_Appender] = None
+        result: Optional[Dict[str, Any]] = None
         try:
             while True:
                 item = self._q.get()
@@ -269,36 +352,41 @@ class StreamRecorder(threading.Thread):
                     if self._error is not None:
                         raise self._error
                     if appender is None:
-                        raise RuntimeError("recording stopped with no frames")
-                    self._extra["attrs"] = (pixel_format, settings, display,
-                                            metas)
+                        if self._fmt != "raw_sequence":
+                            raise RuntimeError("recording stopped with no frames")
+                        appender = self._appender_cls(self._path, self._n_frames,
+                                                      self._blosc)
                     out = appender.finish(pixel_format, settings, display,
                                           metas)
-                    self._results.put({"ok": True, "path": str(out),
-                                       "message": f"Recorded: {out}",
-                                       "frames": appender.count})
+                    result = {"ok": True, "path": str(out),
+                              "message": f"Recorded: {out}",
+                              "frames": appender.count}
                     return
                 if appender is None:
                     appender = self._appender_cls(self._path, self._n_frames,
                                                   self._blosc)
                 try:
-                    appender.add(item[1])
+                    if item[0] == "raw":
+                        appender.add_raw(item[1], item[2], item[3])
+                    else:
+                        appender.add(item[1])
                 except Exception as exc:
                     self._error = exc          # keep draining; fail at finish
         except Exception as exc:
-            if appender is None:
-                self._error = self._error or exc
-            else:
-                self._error = self._error or exc
+            self._error = self._error or exc
         finally:
             if appender is not None and getattr(appender, "_open", None):
                 try:
                     self._cleanup(appender)
                 except Exception:
                     pass
-            if self._error is not None:
-                self._results.put({"ok": False, "path": str(self._path),
-                                   "message": f"Record failed: {self._error}"})
+            if result is None:
+                result = {"ok": False, "path": str(self._path),
+                          "message": f"Record failed: {self._error}"}
+            self._results.put(result)
+            done, self._on_done = self._on_done, None
+            if done is not None:
+                done(result)
 
     @staticmethod
     def _cleanup(appender: _Appender) -> None:
